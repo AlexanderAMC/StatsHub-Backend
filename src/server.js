@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const pool = require('./config/database'); 
 const deportivosRoutes = require('./routes/deportivos.routes');
+const authRoutes = require('./routes/auth.routes');
 
 const app = express();
 
@@ -26,6 +27,7 @@ app.get('/', async (req, res) => {
 
 // Rutas
 app.use('/api', deportivosRoutes);
+app.use('/api/auth', authRoutes);
 
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;

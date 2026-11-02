@@ -92,4 +92,76 @@ const register = async (req, res) => {
   }
 };
 
-module.exports = { login, register };
+// Obtener todos los usuarios
+const getUsuarios = async (req, res) => {
+  try {
+    // Hacemos un JOIN para traer el nombre del rol en lugar del ID
+    const query = `
+      SELECT u.id, u.nombre, u.apellido, u.correo, u.activo, u.rol_id, r.nombre AS rol
+      FROM seguridad.usuarios u
+      JOIN seguridad.roles r ON u.rol_id = r.id
+      ORDER BY u.fecha_creacion DESC
+    `;
+    const result = await pool.query(query);
+    
+    res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al obtener usuarios' });
+  }
+};
+
+// Actualizar el rol de un usuario
+const updateUserRole = async (req, res) => {
+  const { id } = req.params;
+  const { role } = req.body; // Recibimos 'administrador', 'espectador', etc.
+
+  try {
+    // Buscamos el ID del rol por su nombre
+    const roleResult = await pool.query(
+      'SELECT id FROM seguridad.roles WHERE LOWER(nombre) = LOWER($1)', 
+      [role]
+    );
+    
+    if (roleResult.rows.length === 0) return res.status(404).json({ error: 'Rol no encontrado' });
+    
+    const rol_id = roleResult.rows[0].id;
+
+    // Actualizamos al usuario
+    await pool.query('UPDATE seguridad.usuarios SET rol_id = $1 WHERE id = $2', [rol_id, id]);
+    res.json({ mensaje: 'Rol actualizado correctamente' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al actualizar el rol' });
+  }
+};
+
+// Bloquear / Activar usuario
+const updateUserStatus = async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body; // 'activo' o 'bloqueado'
+
+  try {
+    const activo = status === 'activo';
+    await pool.query('UPDATE seguridad.usuarios SET activo = $1 WHERE id = $2', [activo, id]);
+    res.json({ mensaje: 'Estado actualizado correctamente' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al actualizar el estado' });
+  }
+};
+
+// Eliminar un usuario
+const deleteUser = async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query('DELETE FROM seguridad.usuarios WHERE id = $1', [id]);
+    res.json({ mensaje: 'Usuario eliminado correctamente' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error al eliminar el usuario' });
+  }
+};
+
+// Recuerda exportarlas junto a las demás:
+module.exports = { login, register, getUsuarios, updateUserRole, updateUserStatus, deleteUser };
