@@ -13,7 +13,7 @@ Este documento detalla la ubicación exacta, la función y el flujo de todos los
 *   **Función:** Almacena las credenciales de la base de datos y el secreto para firmar los tokens de seguridad.
 *   **Variables clave:**
     *   `DB_NAME=statshub_deportivo`
-    *   `JWT_SECRET=statshub_secreto_super_seguro_2026`
+    *   `JWT_SECRET=<genera_uno_aleatorio_de_al_menos_32_caracteres>`
 
 ### 1.2. Conexión a la Base de Datos
 *   **Archivo:** `src/config/database.js`
@@ -135,7 +135,7 @@ Este documento detalla la ubicación exacta, la función y el flujo de todos los
     DB_NAME=statshub_deportivo
     DB_USER=postgres
     DB_PASSWORD=tu_contraseña
-    JWT_SECRET=statshub_secreto_super_seguro_2026
+    JWT_SECRET=<genera_uno_aleatorio_de_al_menos_32_caracteres>
 1.2. Conexión a la Base de Datos
 Archivo: src/config/database.js
 
