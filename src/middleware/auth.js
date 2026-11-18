@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/database');
 const { getJwtSecret, JWT_ALGORITHM } = require('../config/jwt');
 const { normalizeRole } = require('../config/roles');
+const { hasPermission } = require('../config/permissions');
 
 // Verifica el JWT del header Authorization y carga req.user.
 // El estado y el rol se leen de la BD en cada petición: un usuario bloqueado
@@ -57,4 +58,18 @@ function requireRole(...roles) {
   };
 }
 
-module.exports = { authenticate, requireRole };
+// Exige un permiso RBAC (ver config/permissions.js). Usar después de authenticate.
+// Preferible a requireRole: los endpoints declaran QUÉ se necesita, no QUIÉN puede.
+function requirePermission(permission) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Debes iniciar sesión' });
+    }
+    if (!hasPermission(req.user.rol, permission)) {
+      return res.status(403).json({ error: 'No tienes permisos para esta acción' });
+    }
+    return next();
+  };
+}
+
+module.exports = { authenticate, requireRole, requirePermission };

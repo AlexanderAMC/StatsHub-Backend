@@ -9,8 +9,10 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
 });
 
-pool.on('connect', () => {
-  console.log('✅ Conectado a PostgreSQL - statshub_deportivo');
+// Sin este manejador, un error en un cliente inactivo (p. ej. si se reinicia PostgreSQL)
+// emite un 'error' no capturado y tumba el proceso. El pool descarta ese cliente y sigue.
+pool.on('error', (error) => {
+  console.error('⚠️  Error en una conexión inactiva de PostgreSQL:', error.message);
 });
 
 module.exports = pool;

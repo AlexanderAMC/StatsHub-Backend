@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 
 const TEST_SECRET = 'test-secret-que-tiene-mas-de-32-caracteres-ok';
 process.env.JWT_SECRET = TEST_SECRET;
+process.env.NODE_ENV = 'test';
 
 // Pool falso: cada consulta se resuelve con el primer handler cuyo patrón coincida con el SQL.
 function createFakePool() {
@@ -50,9 +51,10 @@ async function startServer(app) {
   });
 }
 
-async function request(baseUrl, method, urlPath, { body, token, rawBody } = {}) {
+async function request(baseUrl, method, urlPath, { body, token, rawBody, origin } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
+  if (origin) headers.Origin = origin;
   const response = await fetch(`${baseUrl}${urlPath}`, {
     method,
     headers,
