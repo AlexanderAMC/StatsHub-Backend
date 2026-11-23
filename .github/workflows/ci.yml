@@ -1,0 +1,60 @@
+# CI del backend (RNF-23): tests unitarios, de integración contra PostgreSQL real y del servicio de ML.
+# Los tests de integración aplican las migraciones del repositorio StatsHub-Database.
+# Si ese repositorio es privado, crea el secreto DB_REPO_TOKEN (token con lectura del repo).
+name: CI Backend
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: statshub_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: StatsHub-Backend
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/StatsHub-Database
+          ref: develop
+          path: StatsHub-Database
+          token: ${{ secrets.DB_REPO_TOKEN || github.token }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: StatsHub-Backend/.nvmrc
+          cache: npm
+          cache-dependency-path: |
+            StatsHub-Backend/package-lock.json
+            StatsHub-Database/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Dependencias
+        run: |
+          npm ci --prefix StatsHub-Database
+          npm ci --prefix StatsHub-Backend
+          npm rebuild bcrypt --prefix StatsHub-Backend
+          pip install -r StatsHub-Backend/ml-service/requirements.txt
+      - name: Tests del backend (unitarios + integración)
+        working-directory: StatsHub-Backend
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/statshub_test
+        run: npm test
+      - name: Tests del servicio de ML
+        working-directory: StatsHub-Backend/ml-service
+        run: python -m unittest test_app.py
+      - name: Auditoría de dependencias (informativa)
+        working-directory: StatsHub-Backend
+        run: npm audit --omit=dev --audit-level=high || true

@@ -15,7 +15,7 @@ after(async () => {
   await server.close();
 });
 
-const VALID = { nombre: 'Carla', apellido: 'Rojas', correo: 'Carla@StatsHub.cl', password: 'una-clave-segura' };
+const VALID = { nombre: 'Carla', apellido: 'Rojas', correo: 'Carla@StatsHub.cl', password: 'una-clave-segura', aceptaPrivacidad: true };
 
 beforeEach(() => {
   pool.reset();

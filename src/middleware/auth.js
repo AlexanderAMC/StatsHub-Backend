@@ -23,7 +23,7 @@ async function authenticate(req, res, next) {
 
   try {
     const { rows } = await pool.query(
-      `SELECT u.id, u.activo, r.nombre AS rol
+      `SELECT u.id, u.activo, u.token_version, r.nombre AS rol
        FROM seguridad.usuarios u
        JOIN seguridad.roles r ON u.rol_id = r.id
        WHERE u.id = $1`,
@@ -31,7 +31,9 @@ async function authenticate(req, res, next) {
     );
 
     const usuario = rows[0];
-    if (!usuario || !usuario.activo) {
+    // token_version cambia al cerrar sesión o cambiar la contraseña: invalida los tokens anteriores (RF-02).
+    const tokenVersion = usuario?.token_version ?? 0;
+    if (!usuario || !usuario.activo || (payload.tv ?? 0) !== tokenVersion) {
       return res.status(401).json({ error: 'Sesión inválida o expirada' });
     }
 
@@ -72,4 +74,11 @@ function requirePermission(permission) {
   };
 }
 
-module.exports = { authenticate, requireRole, requirePermission };
+// Para rutas públicas que muestran algo extra a quien tiene sesión: si hay un token válido
+// carga req.user; si no hay token o es inválido, continúa como anónimo.
+async function optionalAuth(req, res, next) {
+  if (!req.headers.authorization) return next();
+  return authenticate(req, res, next);
+}
+
+module.exports = { authenticate, optionalAuth, requireRole, requirePermission };

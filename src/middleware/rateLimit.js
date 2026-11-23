@@ -55,4 +55,19 @@ const registerLimiter = createRateLimiter({
   message: 'Demasiados registros desde esta conexión. Intenta más tarde.',
 });
 
-module.exports = { createRateLimiter, loginLimiter, registerLimiter };
+// Recuperación de contraseña: evita usar el formulario para enviar correos masivos.
+const forgotLimiter = createRateLimiter({
+  windowMs: ONE_HOUR,
+  max: 5,
+  message: 'Demasiadas solicitudes de recuperación. Intenta más tarde.',
+});
+
+// Subida de archivos (escudos): protege la CPU del procesamiento de imágenes.
+const uploadLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MINUTES,
+  max: 30,
+  keyGenerator: (req) => req.user?.id ?? req.ip,
+  message: 'Demasiadas subidas de archivos. Intenta en unos minutos.',
+});
+
+module.exports = { createRateLimiter, loginLimiter, registerLimiter, forgotLimiter, uploadLimiter };

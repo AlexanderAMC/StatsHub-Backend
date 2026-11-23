@@ -5,9 +5,13 @@ const morgan = require('morgan');
 const pool = require('./config/database');
 const deportivosRoutes = require('./routes/deportivos.routes');
 const authRoutes = require('./routes/auth.routes');
+const { UPLOADS_DIR } = require('./controllers/equipos.controller');
 const { AppError, PG_ERRORS } = require('./utils/errors');
 
 const app = express();
+
+// Detrás de Nginx / balanceador: req.ip toma la IP real del cliente (rate limiting y auditoría).
+if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
 
 // Orígenes permitidos para CORS (separados por coma). En desarrollo, por defecto el servidor de Vite.
 const DEFAULT_DEV_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173'];
@@ -18,7 +22,10 @@ const allowedOrigins = process.env.FRONTEND_URL
     : DEFAULT_DEV_ORIGINS;
 
 // Middlewares
-app.use(helmet());
+app.use(helmet({
+  // Los escudos (/uploads) se muestran desde el dominio del frontend.
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 app.use(
   cors({
     // Sin cabecera Origin (curl, servidor a servidor) no aplica CORS. Un origen no listado
@@ -31,24 +38,26 @@ if (process.env.NODE_ENV !== 'test') {
 }
 // Límite de tamaño: evita payloads enormes (por ejemplo contraseñas gigantes para bcrypt).
 app.use(express.json({ limit: '10kb' }));
+// Flow envía la confirmación y el retorno como formulario (application/x-www-form-urlencoded).
+app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
-// Ruta de prueba de conexión
-app.get('/', async (req, res) => {
+// Escudos de equipos (WebP generados por el backend). En producción conviene servirlos con Nginx o S3/CloudFront.
+app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '30d', immutable: true, index: false, dotfiles: 'deny' }));
+
+// Estado del servicio (para el balanceador / monitoreo). No expone datos internos.
+app.get(['/', '/api/salud'], async (req, res) => {
   try {
-    const result = await pool.query('SELECT NOW()');
-    res.json({
-      mensaje: 'API StatsHub funcionando correctamente',
-      hora_db: result.rows[0].now,
-    });
+    await pool.query('SELECT 1');
+    res.json({ estado: 'ok', servicio: 'StatsHub API' });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Error conectando a la base de datos' });
+    console.error('Salud: sin conexión a la base de datos:', error.message);
+    res.status(503).json({ estado: 'error', detalle: 'Sin conexión a la base de datos' });
   }
 });
 
 // Rutas
-app.use('/api', deportivosRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api', deportivosRoutes);
 
 // Ruta inexistente: JSON en vez de la página HTML por defecto de Express.
 app.use((req, res) => {
@@ -64,6 +73,11 @@ app.use((err, req, res, next) => {
   }
   if (err.type === 'entity.too.large') {
     return res.status(413).json({ error: 'El cuerpo de la petición es demasiado grande' });
+  }
+  if (err.name === 'MulterError') {
+    return err.code === 'LIMIT_FILE_SIZE'
+      ? res.status(413).json({ error: 'La imagen no puede superar 2 MB' })
+      : res.status(400).json({ error: 'Archivo inválido' });
   }
   if (err instanceof AppError) {
     return res.status(err.status).json({ error: err.message, ...(err.detalles && { detalles: err.detalles }) });

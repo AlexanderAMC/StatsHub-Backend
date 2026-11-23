@@ -4,3 +4,7 @@ coverage/
 dist/
 venv/
 .venv
+uploads/
+__pycache__/
+*.pyc
+ml-service/.venv/

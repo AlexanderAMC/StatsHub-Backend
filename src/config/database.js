@@ -1,4 +1,10 @@
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// Las columnas DATE se devuelven como texto 'AAAA-MM-DD'. Convertirlas a Date de JavaScript
+// las desplaza según el huso horario del servidor (p. ej. 2027-03-01 → 2027-02-28T23:00Z).
+types.setTypeParser(1082, (value) => value);
+// TIMESTAMP sin zona (hora local del partido): se devuelve 'AAAA-MM-DDTHH:MM:SS' sin convertir a UTC.
+types.setTypeParser(1114, (value) => value.replace(' ', 'T'));
 require('dotenv').config();
 
 const pool = new Pool({

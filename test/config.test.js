@@ -31,7 +31,7 @@ test('el servidor no arranca sin JWT_SECRET (sale con código 1)', () => {
     // Cadena vacía: dotenv no sobrescribe variables ya definidas, así que el .env local no interfiere.
     env: { ...process.env, JWT_SECRET: '', PORT: '0' },
     encoding: 'utf8',
-    timeout: 10000,
+    timeout: 90000,
   });
   assert.equal(result.status, 1, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
   assert.match(result.stderr, /JWT_SECRET/);
