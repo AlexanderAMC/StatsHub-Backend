@@ -6,6 +6,7 @@ const { sendMail } = require('../services/mailer');
 const jwt = require('jsonwebtoken');
 const { getJwtSecret, JWT_ALGORITHM, JWT_EXPIRES_IN } = require('../config/jwt');
 const { ROLES, DEFAULT_ROLE, ASSIGNABLE_ROLES, normalizeRole } = require('../config/roles');
+const { effectivePermissions } = require('../config/permissions');
 const { isUuid, isValidEmail, normalizeEmail, validateLogin, validateRegister } = require('../utils/validators');
 const { badRequest } = require('../utils/errors');
 
@@ -275,15 +276,23 @@ const logout = async (req, res) => {
 // 8. PERFIL PROPIO
 const PROFILE_SQL = `
   SELECT u.id, u.nombre, u.apellido, u.correo, u.telefono, u.activo, u.acepta_privacidad_en,
-         u.recibe_notificaciones, u.fecha_creacion, r.nombre AS rol,
+         u.recibe_notificaciones, u.fecha_creacion, u.tarifa_partido, r.nombre AS rol,
+         (SELECT s.plan_codigo FROM pagos.suscripciones s JOIN pagos.planes pl ON pl.codigo = s.plan_codigo
+          WHERE s.usuario_id = u.id AND s.estado = 'ACTIVA' AND s.inicio <= now() AND s.fin > now()
+          ORDER BY pl.nivel DESC LIMIT 1) AS plan,
+         (SELECT MAX(s.fin) FROM pagos.suscripciones s
+          WHERE s.usuario_id = u.id AND s.estado = 'ACTIVA' AND s.fin > now()) AS plan_fin,
          (SELECT e.id FROM deportivo.equipos e WHERE e.entrenador_id = u.id ORDER BY e.id LIMIT 1) AS equipo_id
   FROM seguridad.usuarios u
   JOIN seguridad.roles r ON u.rol_id = r.id
   WHERE u.id = $1`;
 
+// Perfil con los permisos efectivos (rol + plan): el frontend decide con ellos qué mostrar.
+const withPermissions = (profile) => ({ ...profile, permisos: effectivePermissions(normalizeRole(profile.rol), profile.plan) });
+
 const getMe = async (req, res) => {
   const { rows } = await pool.query(PROFILE_SQL, [req.user.id]);
-  return res.json(rows[0]);
+  return res.json(withPermissions(rows[0]));
 };
 
 const updateMe = async (req, res) => {
@@ -308,6 +317,12 @@ const updateMe = async (req, res) => {
     add('telefono', body.telefono || null);
   }
   if (body.recibeNotificaciones !== undefined) add('recibe_notificaciones', Boolean(body.recibeNotificaciones));
+  // Árbitros y estadígrafos: tarifa que cobran por partido (base de sus liquidaciones).
+  if (body.tarifaPartido !== undefined) {
+    const tarifa = body.tarifaPartido === null || body.tarifaPartido === '' ? null : Number(body.tarifaPartido);
+    if (tarifa !== null && (!Number.isInteger(tarifa) || tarifa < 0)) throw badRequest('La tarifa debe ser un entero mayor o igual a 0');
+    add('tarifa_partido', tarifa);
+  }
   // La aceptación de la política solo se puede dar (no retirar desde aquí: retirarla implica cerrar la cuenta).
   if (body.aceptaPrivacidad === true) sets.push('acepta_privacidad_en = COALESCE(acepta_privacidad_en, now())');
 
@@ -315,7 +330,7 @@ const updateMe = async (req, res) => {
   params.push(req.user.id);
   await pool.query(`UPDATE seguridad.usuarios SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
   const { rows } = await pool.query(PROFILE_SQL, [req.user.id]);
-  return res.json(rows[0]);
+  return res.json(withPermissions(rows[0]));
 };
 
 // 9. CAMBIAR CONTRASEÑA: exige la actual e invalida las demás sesiones.

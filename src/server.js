@@ -24,11 +24,13 @@ if (process.env.NODE_ENV === 'production') {
 
 const app = require('./app');
 const pool = require('./config/database');
+const { startExpiryReminders } = require('./services/subscriptions');
 
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`🚀 Servidor corriendo en http://localhost:${PORT}`);
+  startExpiryReminders(); // avisos de planes por vencer (cada hora)
 });
 
 // Apagado ordenado (PM2 / systemd envían SIGINT/SIGTERM): termina las peticiones en curso y cierra el pool.

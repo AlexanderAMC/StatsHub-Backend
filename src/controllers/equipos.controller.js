@@ -4,9 +4,9 @@ const sharp = require('sharp');
 const pool = require('../config/database');
 const { audit } = require('../utils/audit');
 const { notify } = require('../services/notifications.service');
-const { badRequest, notFound, conflict, AppError, PG_ERRORS } = require('../utils/errors');
+const { badRequest, notFound, conflict, PG_ERRORS } = require('../utils/errors');
 const { positiveInt, optionalPositiveInt, text, date } = require('../utils/http');
-const { ROLES } = require('../config/roles');
+const { isLeagueManager, assertTournamentAccess, assertTeamAccess, forbidden } = require('../utils/scope');
 
 const UPLOADS_DIR = path.resolve(process.env.UPLOADS_DIR || path.join(__dirname, '..', '..', 'uploads'));
 const POSITIONS_MAX = 50;
@@ -49,6 +49,15 @@ async function assertCupo(db, torneoId, equipoId = null) {
   if (t.inscritos >= t.cupos) throw conflict(`El torneo no tiene cupos disponibles (${t.cupos})`);
 }
 
+// Vincula la cuenta del entrenador por su correo: undefined = no cambia, '' = quitar.
+async function resolveCoach(value, db = pool) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const { rows } = await db.query('SELECT id FROM seguridad.usuarios WHERE LOWER(correo) = LOWER($1) AND activo', [String(value).trim()]);
+  if (rows.length === 0) throw badRequest('No existe una cuenta activa con el correo del entrenador');
+  return rows[0].id;
+}
+
 async function withTransaction(fn) {
   const client = await pool.connect();
   try {
@@ -68,13 +77,15 @@ const createEquipo = async (req, res) => {
   const nombre = text(req.body?.nombre, 'El nombre del equipo', { max: 150 });
   const torneoId = positiveInt(req.body?.torneo_id, 'El torneo');
   const entrenador = text(req.body?.entrenador, 'El entrenador', { max: 150, required: false });
+  await assertTournamentAccess(req, torneoId);
+  const entrenadorId = await resolveCoach(req.body?.entrenador_correo);
 
   try {
     const id = await withTransaction(async (db) => {
       await assertCupo(db, torneoId);
       const { rows } = await db.query(
-        'INSERT INTO deportivo.equipos (nombre, entrenador) VALUES ($1, $2) RETURNING id',
-        [nombre, entrenador]
+        'INSERT INTO deportivo.equipos (nombre, entrenador, entrenador_id) VALUES ($1, $2, $3) RETURNING id',
+        [nombre, entrenador, entrenadorId ?? null]
       );
       await db.query('INSERT INTO deportivo.torneo_equipos (torneo_id, equipo_id) VALUES ($1, $2)', [torneoId, rows[0].id]);
       return rows[0].id;
@@ -95,10 +106,17 @@ const updateEquipo = async (req, res) => {
 
   const actual = await getEquipo(id);
   if (!actual) throw notFound('Equipo no encontrado');
+  await assertTeamAccess(req, id);
+  if (actual.torneo_id !== torneoId) await assertTournamentAccess(req, torneoId);
+  const entrenadorId = await resolveCoach(req.body?.entrenador_correo);
 
   try {
     await withTransaction(async (db) => {
-      await db.query('UPDATE deportivo.equipos SET nombre = $1, entrenador = $2 WHERE id = $3', [nombre, entrenador, id]);
+      await db.query(
+        'UPDATE deportivo.equipos SET nombre = $1, entrenador = $2, entrenador_id = COALESCE($4, entrenador_id) WHERE id = $3',
+        [nombre, entrenador, id, entrenadorId === undefined ? null : entrenadorId]
+      );
+      if (entrenadorId === null) await db.query('UPDATE deportivo.equipos SET entrenador_id = NULL WHERE id = $1', [id]);
       if (actual.torneo_id !== torneoId) {
         await assertCupo(db, torneoId, id);
         await db.query(
@@ -126,6 +144,7 @@ const updateEquipo = async (req, res) => {
 
 const deleteEquipo = async (req, res) => {
   const id = positiveInt(req.params.id, 'El id');
+  await assertTeamAccess(req, id);
   try {
     const { rows } = await pool.query('DELETE FROM deportivo.equipos WHERE id = $1 RETURNING escudo_url', [id]);
     if (rows.length === 0) throw notFound('Equipo no encontrado');
@@ -149,6 +168,7 @@ async function removeLogoFile(url) {
 const uploadEscudo = async (req, res) => {
   const id = positiveInt(req.params.id, 'El id');
   if (!req.file) throw badRequest('Adjunta una imagen en el campo "escudo"');
+  await assertTeamAccess(req, id);
   const actual = await getEquipo(id);
   if (!actual) throw notFound('Equipo no encontrado');
 
@@ -193,9 +213,13 @@ async function getJugador(id, db = pool) {
 
 // Un entrenador solo puede gestionar el plantel de su propio equipo.
 async function assertCanManageTeam(req, equipoId, db = pool) {
-  if (req.user.rol !== ROLES.COACH || equipoId === null) return;
-  const { rows } = await db.query('SELECT 1 FROM deportivo.equipos WHERE id = $1 AND entrenador_id = $2', [equipoId, req.user.id]);
-  if (rows.length === 0) throw new AppError(403, 'Solo puedes gestionar el plantel de tu equipo');
+  // Jugadores sin equipo: solo la administración de la liga.
+  if (equipoId === null) {
+    if (!isLeagueManager(req.user)) throw forbidden('Indica el equipo del jugador');
+    return;
+  }
+  // Dueño del torneo del equipo o su entrenador (rol entrenador o plan Pro).
+  await assertTeamAccess(req, equipoId, db, { allowCoach: true });
 }
 
 async function assertNumeroLibre(db, equipoId, numero, jugadorId = null) {
@@ -327,6 +351,9 @@ const transferJugador = async (req, res) => {
   const jugador = await getJugador(id);
   if (!jugador) throw notFound('Jugador no encontrado');
   if (jugador.equipo_id === destino) throw badRequest('El jugador ya pertenece a ese equipo');
+  if (jugador.equipo_id !== null) await assertTeamAccess(req, jugador.equipo_id);
+  if (destino !== null) await assertTeamAccess(req, destino);
+  if (jugador.equipo_id === null && destino === null) throw badRequest('Indica el equipo de destino');
 
   await withTransaction(async (db) => {
     await assertNumeroLibre(db, destino, jugador.numero, id);

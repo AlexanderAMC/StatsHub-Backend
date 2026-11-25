@@ -3,6 +3,7 @@ const { audit } = require('../utils/audit');
 const { badRequest, notFound, conflict, PG_ERRORS } = require('../utils/errors');
 const { positiveInt, text, date, oneOf } = require('../utils/http');
 const { ROLES } = require('../config/roles');
+const { isLeagueManager, assertTournamentAccess, forbidden } = require('../utils/scope');
 
 const TOURNAMENT_STATES = ['PLANIFICADO', 'INSCRIPCIONES', 'ACTIVO', 'FINALIZADO', 'CANCELADO'];
 const FORMATS = ['LIGA', 'COPA', 'LIGA_Y_PLAYOFF'];
@@ -17,6 +18,7 @@ const getLiga = async (req, res) => {
 };
 
 const updateLiga = async (req, res) => {
+  if (!isLeagueManager(req.user)) throw forbidden('Solo la administración de la liga puede editar sus datos');
   const b = req.body ?? {};
   const nombre = text(b.nombre, 'El nombre de la liga', { max: 200 });
   const descripcion = text(b.descripcion, 'La descripción', { max: 2000, required: false });
@@ -74,6 +76,7 @@ const createCategoria = async (req, res) => {
 };
 
 const deleteCategoria = async (req, res) => {
+  if (!isLeagueManager(req.user)) throw forbidden('Solo la administración de la liga puede eliminar categorías');
   const id = positiveInt(req.params.id, 'El id');
   try {
     const { rowCount } = await pool.query('DELETE FROM deportivo.categorias WHERE id = $1', [id]);
@@ -89,7 +92,7 @@ const deleteCategoria = async (req, res) => {
 // ===================== TORNEOS (RF-09, RF-11) =====================
 
 const TOURNAMENT_SQL = `
-  SELECT t.id, t.nombre, t.fecha_inicio, t.fecha_fin, t.estado, t.cupos, t.formato, t.costo_inscripcion,
+  SELECT t.id, t.nombre, t.fecha_inicio, t.fecha_fin, t.estado, t.cupos, t.formato, t.costo_inscripcion, t.organizador_id,
          t.categoria_id, c.nombre AS categoria,
          COUNT(te.equipo_id)::int AS cantidad_equipos
   FROM deportivo.torneos t
@@ -136,9 +139,10 @@ const createTorneo = async (req, res) => {
   const categoriaId = await resolveCategoria(req.body ?? {});
   try {
     const { rows } = await pool.query(
-      `INSERT INTO deportivo.torneos (nombre, categoria_id, fecha_inicio, fecha_fin, estado, cupos, formato, costo_inscripcion)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-      [t.nombre, categoriaId, t.fechaInicio, t.fechaFin, t.estado, t.cupos, t.formato, t.costo]
+      `INSERT INTO deportivo.torneos (nombre, categoria_id, fecha_inicio, fecha_fin, estado, cupos, formato, costo_inscripcion, organizador_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      // Torneo de la liga (NULL) si lo crea la administración; si no, queda a nombre del organizador del plan Ultra.
+      [t.nombre, categoriaId, t.fechaInicio, t.fechaFin, t.estado, t.cupos, t.formato, t.costo, isLeagueManager(req.user) ? null : req.user.id]
     );
     audit(req, { accion: 'CREAR_TORNEO', tabla: 'deportivo.torneos', registroId: rows[0].id, detalle: { nombre: t.nombre } });
     res.status(201).json(await getTorneo(rows[0].id));
@@ -150,6 +154,7 @@ const createTorneo = async (req, res) => {
 
 const updateTorneo = async (req, res) => {
   const id = positiveInt(req.params.id, 'El id');
+  await assertTournamentAccess(req, id);
   const actual = await getTorneo(id);
   if (!actual) throw notFound('Torneo no encontrado');
   // RF-11: un torneo finalizado o cancelado ya no se modifica.
@@ -175,6 +180,7 @@ const updateTorneo = async (req, res) => {
 
 const deleteTorneo = async (req, res) => {
   const id = positiveInt(req.params.id, 'El id');
+  await assertTournamentAccess(req, id);
   try {
     const { rowCount } = await pool.query('DELETE FROM deportivo.torneos WHERE id = $1', [id]);
     if (rowCount === 0) throw notFound('Torneo no encontrado');

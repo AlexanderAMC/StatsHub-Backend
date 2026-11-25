@@ -6,6 +6,7 @@ const { badRequest, notFound, conflict, AppError } = require('../utils/errors');
 const { positiveInt, text, date, time } = require('../utils/http');
 const { ROLES } = require('../config/roles');
 const { isUuid } = require('../utils/validators');
+const { isLeagueManager, assertTournamentAccess, assertMatchAccess, forbidden } = require('../utils/scope');
 
 const MAX_SUBSTITUTIONS = 5;
 const MAX_MINUTE = 130;
@@ -16,6 +17,7 @@ const DOUBLE_YELLOW = 'DOBLE_AMARILLA';
 const MATCH_SQL = `
   SELECT p.id, p.torneo_id, p.jornada, p.equipo_local, p.equipo_visita, p.fecha_partido, p.cancha, p.estado,
          p.arbitro_id, p.estadigrafo_id, p.minuto, p.alineacion, p.iniciado_en, p.acta_cerrada_en,
+         p.doble_funcion, p.acta_validada_en,
          el.nombre AS equipo_local_nombre, ev.nombre AS equipo_visita_nombre,
          COALESCE(r.goles_local, 0) AS goles_local, COALESCE(r.goles_visita, 0) AS goles_visita
   FROM deportivo.partidos p
@@ -87,6 +89,7 @@ function parsePartido(body) {
     torneoId, jornada, local, visita, fechaHora: `${fecha} ${hora}:00`, cancha,
     arbitroId: optionalUserId(body.arbitro_id, 'El árbitro'),
     estadigrafoId: optionalUserId(body.estadigrafo_id, 'El estadígrafo'),
+    dobleFuncion: body.doble_funcion === true,
   };
 }
 
@@ -124,9 +127,9 @@ async function validateSchedule(db, p, ignoreId = null) {
 
 async function insertPartido(db, p) {
   const { rows } = await db.query(
-    `INSERT INTO deportivo.partidos (torneo_id, jornada, equipo_local, equipo_visita, fecha_partido, cancha, arbitro_id, estadigrafo_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-    [p.torneoId, p.jornada, p.local, p.visita, p.fechaHora, p.cancha, p.arbitroId, p.estadigrafoId]
+    `INSERT INTO deportivo.partidos (torneo_id, jornada, equipo_local, equipo_visita, fecha_partido, cancha, arbitro_id, estadigrafo_id, doble_funcion)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+    [p.torneoId, p.jornada, p.local, p.visita, p.fechaHora, p.cancha, p.arbitroId, p.estadigrafoId, p.dobleFuncion]
   );
   return rows[0].id;
 }
@@ -136,6 +139,7 @@ const whenLabel = (m) => (m.fecha_partido ? m.fecha_partido.replace('T', ' ').sl
 
 const createPartido = async (req, res) => {
   const p = parsePartido(req.body ?? {});
+  await assertTournamentAccess(req, p.torneoId);
   const id = await withTransaction(async (db) => {
     await validateSchedule(db, p);
     return insertPartido(db, p);
@@ -152,6 +156,7 @@ const createPartidosLote = async (req, res) => {
   const list = req.body?.partidos;
   if (!Array.isArray(list) || list.length === 0 || list.length > 500) throw badRequest('Envía entre 1 y 500 partidos');
   const parsed = list.map(parsePartido);
+  for (const torneoId of new Set(parsed.map((p) => p.torneoId))) await assertTournamentAccess(req, torneoId);
   const ids = await withTransaction(async (db) => {
     const created = [];
     for (const p of parsed) {
@@ -171,6 +176,7 @@ const updatePartido = async (req, res) => {
   const actual = await getPartido(id);
   if (!actual) throw notFound('Partido no encontrado');
   if (actual.estado !== 'PROGRAMADO') throw conflict('Solo se pueden modificar partidos programados');
+  await assertTournamentAccess(req, actual.torneo_id);
   // El torneo no cambia al editar.
   const p = parsePartido({ ...req.body, torneo_id: actual.torneo_id });
   await withTransaction(async (db) => {
@@ -178,9 +184,9 @@ const updatePartido = async (req, res) => {
     await db.query(
       `UPDATE deportivo.partidos
        SET jornada = $1, equipo_local = $2, equipo_visita = $3, fecha_partido = $4, cancha = $5,
-           arbitro_id = $6, estadigrafo_id = $7, actualizado_en = now()
+           arbitro_id = $6, estadigrafo_id = $7, doble_funcion = $9, actualizado_en = now()
        WHERE id = $8`,
-      [p.jornada, p.local, p.visita, p.fechaHora, p.cancha, p.arbitroId, p.estadigrafoId, id]
+      [p.jornada, p.local, p.visita, p.fechaHora, p.cancha, p.arbitroId, p.estadigrafoId, id, p.dobleFuncion]
     );
   });
   const partido = await getPartido(id);
@@ -195,6 +201,7 @@ const suspenderPartido = async (req, res) => {
   const actual = await getPartido(id);
   if (!actual) throw notFound('Partido no encontrado');
   if (actual.estado !== 'PROGRAMADO') throw conflict('Solo se pueden suspender partidos programados');
+  await assertTournamentAccess(req, actual.torneo_id);
   await pool.query(`UPDATE deportivo.partidos SET estado = 'SUSPENDIDO', actualizado_en = now() WHERE id = $1`, [id]);
   notify({ tipo: 'cambio', titulo: 'Partido suspendido', mensaje: `${matchLabel(actual)} (${whenLabel(actual)}) fue suspendido`, partidoId: id });
   audit(req, { accion: 'SUSPENDER_PARTIDO', tabla: 'deportivo.partidos', registroId: id });
@@ -207,6 +214,7 @@ const recordatorioPartido = async (req, res) => {
   const actual = await getPartido(id);
   if (!actual) throw notFound('Partido no encontrado');
   if (actual.estado !== 'PROGRAMADO') throw conflict('Solo se envían recordatorios de partidos programados');
+  await assertTournamentAccess(req, actual.torneo_id);
   await notify({ tipo: 'recordatorio', titulo: 'Recordatorio de partido', mensaje: `${matchLabel(actual)} · ${whenLabel(actual)} · ${actual.cancha}`, partidoId: id });
   res.json({ mensaje: 'Recordatorio enviado' });
 };
@@ -215,13 +223,16 @@ const recordatorioPartido = async (req, res) => {
 
 // RF-21: estadígrafos y árbitros solo operan el acta del día y de los partidos que tienen asignados.
 // Organizadores y administradores pueden hacerlo siempre (correcciones, partidos atrasados).
-function assertActaAccess(req, partido) {
-  const operator = [ROLES.STATS, ROLES.REFEREE].includes(req.user.rol);
-  if (!operator) return;
+async function assertActaAccess(req, partido) {
+  if (isLeagueManager(req.user)) return;
   const assigned = [partido.arbitro_id, partido.estadigrafo_id].filter(Boolean);
-  if (assigned.length > 0 && !assigned.includes(req.user.id)) {
+  if (assigned.includes(req.user.id)) return;
+  if ([ROLES.STATS, ROLES.REFEREE].includes(req.user.rol)) {
+    if (assigned.length === 0) return;
     throw new AppError(403, 'Este partido está asignado a otro árbitro o estadígrafo');
   }
+  // Organizador del plan Ultra: solo partidos de sus torneos.
+  await assertTournamentAccess(req, partido.torneo_id);
 }
 
 function assertMatchDay(req, partido) {
@@ -258,7 +269,7 @@ const iniciarPartido = async (req, res) => {
     const partido = await getPartido(id, db, { lock: true });
     if (!partido) throw notFound('Partido no encontrado');
     if (partido.estado !== 'PROGRAMADO') throw conflict('Solo se pueden iniciar partidos programados');
-    assertActaAccess(req, partido);
+    await assertActaAccess(req, partido);
     assertMatchDay(req, partido);
     const [rosterHome, rosterAway] = await Promise.all([rosterIds(db, partido.equipo_local), rosterIds(db, partido.equipo_visita)]);
     if (!home.every((j) => rosterHome.includes(j)) || !away.every((j) => rosterAway.includes(j))) {
@@ -289,7 +300,7 @@ const setMinuto = async (req, res) => {
   const partido = await getPartido(id);
   if (!partido) throw notFound('Partido no encontrado');
   assertLive(partido);
-  assertActaAccess(req, partido);
+  await assertActaAccess(req, partido);
   await pool.query('UPDATE deportivo.partidos SET minuto = $1, actualizado_en = now() WHERE id = $2', [minuto, id]);
   changed(id);
   res.json({ id, minuto });
@@ -340,7 +351,7 @@ const addEvento = async (req, res) => {
     const partido = await getPartido(id, db, { lock: true });
     if (!partido) throw notFound('Partido no encontrado');
     assertLive(partido);
-    assertActaAccess(req, partido);
+    await assertActaAccess(req, partido);
     const side = SIDES[lado];
     const equipoId = side === 'home' ? partido.equipo_local : partido.equipo_visita;
     const roster = await rosterIds(db, equipoId);
@@ -398,7 +409,7 @@ const undoUltimoEvento = async (req, res) => {
     const partido = await getPartido(id, db, { lock: true });
     if (!partido) throw notFound('Partido no encontrado');
     assertLive(partido);
-    assertActaAccess(req, partido);
+    await assertActaAccess(req, partido);
     const { rows } = await db.query(`${EVENT_SQL} WHERE partido_id = $1 ORDER BY id DESC LIMIT 2`, [id]);
     if (rows.length === 0) throw conflict('No hay eventos para deshacer');
     // Una roja por doble amarilla se deshace junto con la amarilla que la provocó.
@@ -422,7 +433,7 @@ const finalizarPartido = async (req, res) => {
     const partido = await getPartido(id, db, { lock: true });
     if (!partido) throw notFound('Partido no encontrado');
     assertLive(partido);
-    assertActaAccess(req, partido);
+    await assertActaAccess(req, partido);
     await db.query(
       `UPDATE deportivo.partidos
        SET estado = 'FINALIZADO', acta_cerrada_en = now(), acta_cerrada_por = $1, actualizado_en = now()
@@ -442,7 +453,45 @@ const finalizarPartido = async (req, res) => {
   res.json(partido);
 };
 
+// RF-31: informe del árbitro y validación (firma digital) del acta cerrada.
+const informeArbitral = async (req, res) => {
+  const id = positiveInt(req.params.id, 'El id');
+  const informe = text(req.body?.informe, 'El informe', { max: 5000 });
+  const partido = await getPartido(id);
+  if (!partido) throw notFound('Partido no encontrado');
+  if (!partido.acta_cerrada_en) throw conflict('El acta debe estar cerrada antes de validarla');
+  if (!isLeagueManager(req.user) && partido.arbitro_id !== req.user.id) throw forbidden('Solo el árbitro asignado puede validar el acta');
+  await pool.query(
+    'UPDATE deportivo.partidos SET informe_arbitral = $1, acta_validada_en = now(), acta_validada_por = $2 WHERE id = $3',
+    [informe, req.user.id, id]
+  );
+  const owner = await pool.query('SELECT organizador_id FROM deportivo.torneos WHERE id = $1', [partido.torneo_id]);
+  if (owner.rows[0]?.organizador_id) {
+    notify({ tipo: 'acta', titulo: 'Acta validada por el árbitro', mensaje: matchLabel(partido), usuarioId: owner.rows[0].organizador_id, partidoId: id });
+  }
+  audit(req, { accion: 'VALIDAR_ACTA', tabla: 'deportivo.partidos', registroId: id });
+  changed(id);
+  res.json({ mensaje: 'Acta validada', acta_validada_en: new Date().toISOString() });
+};
+
+// El informe lo ven la administración, el dueño del torneo y los oficiales asignados (no el público).
+const getInforme = async (req, res) => {
+  const id = positiveInt(req.params.id, 'El id');
+  const { rows } = await pool.query(
+    `SELECT p.torneo_id, p.arbitro_id, p.estadigrafo_id, p.informe_arbitral, p.acta_validada_en,
+            u.nombre || ' ' || u.apellido AS validado_por
+     FROM deportivo.partidos p LEFT JOIN seguridad.usuarios u ON u.id = p.acta_validada_por
+     WHERE p.id = $1`,
+    [id]
+  );
+  if (rows.length === 0) throw notFound('Partido no encontrado');
+  const p = rows[0];
+  if (![p.arbitro_id, p.estadigrafo_id].includes(req.user.id)) await assertMatchAccess(req, id);
+  res.json({ informe_arbitral: p.informe_arbitral, acta_validada_en: p.acta_validada_en, validado_por: p.validado_por });
+};
+
 module.exports = {
+  informeArbitral, getInforme,
   listPartidos, getPartido, listEventos,
   createPartido, createPartidosLote, updatePartido, suspenderPartido, recordatorioPartido,
   iniciarPartido, setMinuto, addEvento, undoUltimoEvento, finalizarPartido,

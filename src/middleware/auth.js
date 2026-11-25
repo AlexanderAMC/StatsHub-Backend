@@ -2,7 +2,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/database');
 const { getJwtSecret, JWT_ALGORITHM } = require('../config/jwt');
 const { normalizeRole } = require('../config/roles');
-const { hasPermission } = require('../config/permissions');
+const { effectivePermissions } = require('../config/permissions');
 
 // Verifica el JWT del header Authorization y carga req.user.
 // El estado y el rol se leen de la BD en cada petición: un usuario bloqueado
@@ -23,7 +23,10 @@ async function authenticate(req, res, next) {
 
   try {
     const { rows } = await pool.query(
-      `SELECT u.id, u.activo, u.token_version, r.nombre AS rol
+      `SELECT u.id, u.activo, u.token_version, r.nombre AS rol,
+              (SELECT s.plan_codigo FROM pagos.suscripciones s JOIN pagos.planes pl ON pl.codigo = s.plan_codigo
+               WHERE s.usuario_id = u.id AND s.estado = 'ACTIVA' AND s.inicio <= now() AND s.fin > now()
+               ORDER BY pl.nivel DESC LIMIT 1) AS plan
        FROM seguridad.usuarios u
        JOIN seguridad.roles r ON u.rol_id = r.id
        WHERE u.id = $1`,
@@ -37,7 +40,9 @@ async function authenticate(req, res, next) {
       return res.status(401).json({ error: 'Sesión inválida o expirada' });
     }
 
-    req.user = { id: usuario.id, rol: normalizeRole(usuario.rol) };
+    const rol = normalizeRole(usuario.rol);
+    // Permisos efectivos = rol + plan de pago activo (el plan nunca otorga administración).
+    req.user = { id: usuario.id, rol, plan: usuario.plan ?? null, permissions: effectivePermissions(rol, usuario.plan) };
     return next();
   } catch (error) {
     console.error('Error verificando sesión:', error);
@@ -67,7 +72,7 @@ function requirePermission(permission) {
     if (!req.user) {
       return res.status(401).json({ error: 'Debes iniciar sesión' });
     }
-    if (!hasPermission(req.user.rol, permission)) {
+    if (!(req.user.permissions ?? effectivePermissions(req.user.rol)).includes(permission)) {
       return res.status(403).json({ error: 'No tienes permisos para esta acción' });
     }
     return next();

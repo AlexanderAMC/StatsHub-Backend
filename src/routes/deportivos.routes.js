@@ -9,8 +9,11 @@ const estadisticas = require('../controllers/estadisticas.controller');
 const notificaciones = require('../controllers/notificaciones.controller');
 const pagos = require('../controllers/pagos.controller');
 const auditoria = require('../controllers/auditoria.controller');
+const planes = require('../controllers/planes.controller');
+const cobros = require('../controllers/cobros.controller');
+const oficiales = require('../controllers/oficiales.controller');
 const { subscribe } = require('../realtime/hub');
-const { authenticate, requirePermission } = require('../middleware/auth');
+const { authenticate, optionalAuth, requirePermission } = require('../middleware/auth');
 const { uploadLimiter } = require('../middleware/rateLimit');
 const { PERMISSIONS } = require('../config/permissions');
 const { badRequest } = require('../utils/errors');
@@ -37,11 +40,19 @@ router.get('/partidos', partidos.listPartidos);
 router.get('/eventos', partidos.listEventos);
 router.get('/tiempo-real', subscribe);
 router.get('/estadisticas/posiciones', estadisticas.posiciones);
-router.get('/estadisticas/goleadores', estadisticas.goleadores);
-router.get('/estadisticas/asistencias', estadisticas.asistencias);
-router.get('/estadisticas/fair-play', estadisticas.fairPlay);
-router.get('/estadisticas/predicciones', estadisticas.predicciones);
-router.get('/estadisticas/equipos/:id/rendimiento', estadisticas.rendimientoEquipo);
+// Estadísticas avanzadas: plan Básico o superior. Predicción con ML: plan Pro o superior.
+router.get('/estadisticas/goleadores', ...can(P.STATS_ADVANCED), estadisticas.goleadores);
+router.get('/estadisticas/asistencias', ...can(P.STATS_ADVANCED), estadisticas.asistencias);
+router.get('/estadisticas/fair-play', ...can(P.STATS_ADVANCED), estadisticas.fairPlay);
+router.get('/estadisticas/predicciones', ...can(P.ANALYTICS), estadisticas.predicciones);
+router.get('/estadisticas/equipos/:id/rendimiento', ...can(P.STATS_ADVANCED), estadisticas.rendimientoEquipo);
+
+// ---------- Planes y suscripciones (modelo freemium) ----------
+router.get('/planes', optionalAuth, planes.listPlanes);
+router.get('/suscripciones/mia', authenticate, planes.miSuscripcion);
+router.post('/suscripciones', authenticate, planes.comprarPlan);
+router.put('/planes/:codigo', ...can(P.MANAGE_USERS), planes.updatePlan);
+router.get('/suscripciones', ...can(P.MANAGE_USERS), planes.resumenSuscripciones);
 
 // ---------- Liga, categorías y torneos ----------
 router.put('/liga', ...can(P.MANAGE_TOURNAMENTS), catalogo.updateLiga);
@@ -75,17 +86,38 @@ router.put('/partidos/:id/minuto', ...can(P.RECORD_MATCHES), partidos.setMinuto)
 router.post('/partidos/:id/eventos', ...can(P.RECORD_MATCHES), partidos.addEvento);
 router.delete('/partidos/:id/eventos/ultimo', ...can(P.RECORD_MATCHES), partidos.undoUltimoEvento);
 router.post('/partidos/:id/finalizar', ...can(P.RECORD_MATCHES), partidos.finalizarPartido);
+router.post('/partidos/:id/informe', ...can(P.RECORD_MATCHES), partidos.informeArbitral);
+router.get('/partidos/:id/informe', authenticate, partidos.getInforme);
+
+// ---------- Cobros a equipos (inscripciones y planillas) ----------
+router.get('/cobros', authenticate, cobros.listCobros);
+router.post('/cobros', ...can(P.COLLECT), cobros.createCobro);
+router.post('/cobros/planillas', ...can(P.COLLECT), cobros.createPlanillasPartido);
+router.post('/cobros/:id/pagar', authenticate, cobros.pagarCobro);
+router.post('/cobros/:id/anular', ...can(P.COLLECT), cobros.anularCobro);
+
+// ---------- Oficiales: tarifas y liquidaciones ----------
+router.put('/torneos/:id/oficiales/:usuarioId', ...can(P.PAY_OFFICIALS), oficiales.setTarifaTorneo);
+router.get('/liquidaciones/pendientes', ...can(P.PAY_OFFICIALS), oficiales.pendientes);
+router.get('/liquidaciones/mis-pendientes', authenticate, oficiales.misPendientes);
+router.get('/liquidaciones', authenticate, oficiales.listLiquidaciones);
+router.post('/liquidaciones', ...can(P.PAY_OFFICIALS), oficiales.crearLiquidacion);
+router.get('/liquidaciones/:id', authenticate, oficiales.getLiquidacion);
+router.post('/liquidaciones/:id/pagar', ...can(P.PAY_OFFICIALS), oficiales.pagarLiquidacion);
+router.post('/liquidaciones/:id/confirmar', authenticate, oficiales.confirmarLiquidacion);
+router.post('/liquidaciones/:id/anular', ...can(P.PAY_OFFICIALS), oficiales.anularLiquidacion);
 
 // ---------- Notificaciones ----------
 router.get('/notificaciones', authenticate, notificaciones.listNotificaciones);
 router.post('/notificaciones/leidas', authenticate, notificaciones.marcarLeidas);
 
 // ---------- Pagos con Flow ----------
-router.post('/pagos/inscripcion', ...can(P.MANAGE_TEAMS), pagos.crearCobroInscripcion);
+// Inscripción: el controlador verifica que sea el dueño del torneo o el entrenador del equipo.
+router.post('/pagos/inscripcion', authenticate, pagos.crearCobroInscripcion);
 // Webhook y retorno: los llama Flow (sin JWT); el estado se verifica consultando a Flow.
 router.post('/pagos/flow/confirmacion', pagos.confirmacionFlow);
 router.all('/pagos/flow/retorno', pagos.retornoFlow);
-router.get('/pagos', ...can(P.MANAGE_TEAMS), pagos.listPagos);
+router.get('/pagos', authenticate, pagos.listPagos);
 router.get('/pagos/:id', authenticate, pagos.getPago);
 
 // ---------- Auditoría ----------

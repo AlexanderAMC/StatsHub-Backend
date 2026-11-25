@@ -44,7 +44,7 @@ before(async () => {
     JWT_SECRET: 'integracion-secreto-con-mas-de-32-caracteres!!', NODE_ENV: 'test',
     UPLOADS_DIR: path.join(require('node:os').tmpdir(), `statshub-uploads-${process.pid}`),
   });
-  delete process.env.ML_SERVICE_URL;
+  process.env.ML_SERVICE_URL = ''; // vacía (no borrada): dotenv no la sobrescribe con la del .env
 
   const { Client } = require('pg');
   const admin = new Client({ connectionString: url });
@@ -219,18 +219,18 @@ test('estadísticas: posiciones, goleadores, asistencias, fair play y predicció
   assert.equal(tabla.body.length, 2);
   assert.ok(tabla.body.every((r) => r.pj === 1 && r.pts === 1 && r.pe === 1));
 
-  const goleadores = await api('GET', `/estadisticas/goleadores?torneo_id=${ctx.torneo.id}`);
+  const goleadores = await api('GET', `/estadisticas/goleadores?torneo_id=${ctx.torneo.id}`, { token: tokens.organizador });
   assert.equal(goleadores.body.length, 2);
-  const asistencias = await api('GET', `/estadisticas/asistencias?torneo_id=${ctx.torneo.id}`);
+  const asistencias = await api('GET', `/estadisticas/asistencias?torneo_id=${ctx.torneo.id}`, { token: tokens.organizador });
   assert.equal(asistencias.body[0].jugador_id, ctx.h[1]);
-  const fair = await api('GET', `/estadisticas/fair-play?torneo_id=${ctx.torneo.id}`);
+  const fair = await api('GET', `/estadisticas/fair-play?torneo_id=${ctx.torneo.id}`, { token: tokens.organizador });
   assert.equal(fair.body.find((r) => r.equipo_id === ctx.away.id).amarillas, 1);
 
   await api('POST', '/partidos', {
     token: tokens.organizador,
     body: { torneo_id: ctx.torneo.id, jornada: 2, equipo_local: ctx.away.id, equipo_visita: ctx.home.id, fecha: '2026-03-14', hora: '15:00', cancha: 'Cancha 2' },
   });
-  const pred = await api('GET', `/estadisticas/predicciones?torneo_id=${ctx.torneo.id}`);
+  const pred = await api('GET', `/estadisticas/predicciones?torneo_id=${ctx.torneo.id}`, { token: tokens.organizador });
   assert.equal(pred.body.length, 1);
   const p = pred.body[0];
   assert.ok(Math.abs(p.local + p.empate + p.visita - 1) < 1e-6);
@@ -384,4 +384,164 @@ test('un torneo con partidos no se elimina: se cancela', opts, async () => {
   });
   assert.equal(cancel.status, 200);
   assert.equal((await api('PUT', `/torneos/${t.id}`, { token: tokens.organizador, body: { nombre: 'Otro', categoria_id: t.categoria_id, fecha_inicio: '2026-01-01' } })).status, 409);
+});
+
+
+// ======================= PLANES, PROPIEDAD, COBROS Y OFICIALES =======================
+
+// Simula Flow: guarda el monto de cada orden y responde "pagado" al consultar el estado.
+let flowSeq = 0; // tokens únicos entre llamadas (como los de Flow)
+async function withFlow(fn) {
+  Object.assign(process.env, { FLOW_API_KEY: 'k', FLOW_SECRET_KEY: 's', FLOW_API_URL: 'https://flow.test/api' });
+  const realFetch = global.fetch;
+  const amounts = new Map();
+  global.fetch = async (input, init) => {
+    const target = String(input);
+    if (!target.startsWith('https://flow.test/api')) return realFetch(input, init);
+    const json = (data) => new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (target.includes('/payment/create')) {
+      const token = `tok-plan-${++flowSeq}`;
+      amounts.set(token, Number(new URLSearchParams(String(init.body)).get('amount')));
+      return json({ url: 'https://flow.test/pay', token, flowOrder: 900 + flowSeq });
+    }
+    const token = new URL(target).searchParams.get('token');
+    return json({ status: 2, amount: amounts.get(token), flowOrder: 900, paymentData: { media: 'Webpay' } });
+  };
+  const pay = async (url) => {
+    const token = new URL(url).searchParams.get('token');
+    const res = await realFetch(`http://127.0.0.1:${server.address().port}/api/pagos/flow/confirmacion`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token }),
+    });
+    assert.equal(res.status, 200);
+  };
+  try {
+    await fn(pay);
+  } finally {
+    global.fetch = realFetch;
+    delete process.env.FLOW_API_KEY;
+    delete process.env.FLOW_SECRET_KEY;
+  }
+}
+
+async function newUser(correo) {
+  await api('POST', '/auth/register', { body: { nombre: 'Usuario', apellido: correo.split('@')[0], correo, password: 'clave-segura-1', aceptaPrivacidad: true } });
+  return (await api('POST', '/auth/login', { body: { correo, password: 'clave-segura-1' } })).body.token;
+}
+
+test('planes: el espectador no ve estadísticas avanzadas; con el plan Ultra se vuelve organizador de sus torneos', opts, async () => {
+  const planes = await api('GET', '/planes');
+  assert.deepEqual(planes.body.map((p) => p.codigo), ['BASICO', 'PRO', 'ULTRA']);
+
+  tokens.ultra = await newUser('ultra@test.cl');
+  assert.equal((await api('GET', '/estadisticas/goleadores', { token: tokens.ultra })).status, 403);
+  assert.equal((await api('GET', '/estadisticas/posiciones')).status, 200, 'la tabla de posiciones es pública');
+  assert.equal((await api('POST', '/torneos', { token: tokens.ultra, body: { nombre: 'X' } })).status, 403);
+
+  await withFlow(async (pay) => {
+    const compra = await api('POST', '/suscripciones', { token: tokens.ultra, body: { plan: 'ultra', periodo: 'mes' } });
+    assert.equal(compra.status, 201, JSON.stringify(compra.body));
+    await pay(compra.body.url);
+  });
+  const me = await api('GET', '/auth/me', { token: tokens.ultra });
+  assert.equal(me.body.plan, 'ULTRA');
+  assert.ok(me.body.permisos.includes('torneos:gestionar'));
+  assert.ok(!me.body.permisos.includes('usuarios:gestionar'), 'un plan nunca entrega administración');
+  const mia = await api('GET', '/suscripciones/mia', { token: tokens.ultra });
+  assert.equal(mia.body.plan.plan_codigo, 'ULTRA');
+  assert.equal(mia.body.historial.length, 1);
+});
+
+test('propiedad: el organizador Ultra gestiona solo sus torneos', opts, async () => {
+  const torneo = await api('POST', '/torneos', {
+    token: tokens.ultra,
+    body: { nombre: 'Liga Ultra', categoria: 'Adulto', cupos: 4, estado: 'ACTIVO', fecha_inicio: '2026-03-01' },
+  });
+  assert.equal(torneo.status, 201, JSON.stringify(torneo.body));
+  assert.ok(torneo.body.organizador_id);
+  ctx.ultraTorneo = torneo.body;
+  const ajeno = ctx.torneo;
+  assert.equal((await api('PUT', `/torneos/${ajeno.id}`, { token: tokens.ultra, body: { nombre: 'Robado', categoria_id: ajeno.categoria_id, fecha_inicio: '2026-01-01' } })).status, 403);
+  assert.equal((await api('POST', '/equipos', { token: tokens.ultra, body: { nombre: 'Intruso', torneo_id: ajeno.id } })).status, 403);
+  assert.equal((await api('DELETE', `/equipos/${ctx.home.id}`, { token: tokens.ultra })).status, 403);
+});
+
+test('entrenador Pro vinculado por correo: gestiona solo su equipo', opts, async () => {
+  tokens.coach = await newUser('coach@test.cl');
+  await withFlow(async (pay) => {
+    const compra = await api('POST', '/suscripciones', { token: tokens.coach, body: { plan: 'PRO', periodo: 'SEMANA' } });
+    await pay(compra.body.url);
+  });
+  const a = await api('POST', '/equipos', { token: tokens.ultra, body: { nombre: 'Cóndores', torneo_id: ctx.ultraTorneo.id, entrenador_correo: 'coach@test.cl' } });
+  const b = await api('POST', '/equipos', { token: tokens.ultra, body: { nombre: 'Pumas', torneo_id: ctx.ultraTorneo.id } });
+  assert.equal(a.status, 201, JSON.stringify(a.body));
+  assert.ok(a.body.entrenador_id);
+  ctx.uHome = a.body;
+  ctx.uAway = b.body;
+  const propio = await api('POST', '/jugadores', { token: tokens.coach, body: { nombre: 'Delantero', numero: 9, equipo_id: ctx.uHome.id } });
+  assert.equal(propio.status, 201, JSON.stringify(propio.body));
+  assert.equal((await api('POST', '/jugadores', { token: tokens.coach, body: { nombre: 'X', numero: 9, equipo_id: ctx.uAway.id } })).status, 403);
+  const rival = await api('POST', '/jugadores', { token: tokens.ultra, body: { nombre: 'Arquero', numero: 1, equipo_id: ctx.uAway.id } });
+  ctx.uPlayers = { home: propio.body.id, away: rival.body.id };
+});
+
+test('cobros: planillas por partido y el entrenador paga la de su equipo con Flow', opts, async () => {
+  const partido = await api('POST', '/partidos', {
+    token: tokens.ultra,
+    body: { torneo_id: ctx.ultraTorneo.id, equipo_local: ctx.uHome.id, equipo_visita: ctx.uAway.id, fecha: '2026-03-08', hora: '10:00', cancha: 'Cancha 2', arbitro_id: ctx.arbitro.id, estadigrafo_id: ctx.estadigrafo.id },
+  });
+  assert.equal(partido.status, 201, JSON.stringify(partido.body));
+  ctx.uPartido = partido.body;
+  const planillas = await api('POST', '/cobros/planillas', { token: tokens.ultra, body: { partido_id: ctx.uPartido.id, monto: 5000 } });
+  assert.equal(planillas.body.creados, 2, JSON.stringify(planillas.body));
+  assert.equal((await api('POST', '/cobros/planillas', { token: tokens.ultra, body: { partido_id: ctx.uPartido.id, monto: 5000 } })).status, 409);
+
+  const cobros = await api('GET', '/cobros', { token: tokens.coach });
+  assert.equal(cobros.body.length, 1, 'el entrenador solo ve los cobros de su equipo');
+  const otro = (await api('GET', '/cobros', { token: tokens.ultra })).body.find((x) => x.equipo_id === ctx.uAway.id);
+  assert.equal((await api('POST', `/cobros/${otro.id}/pagar`, { token: tokens.coach })).status, 403);
+
+  await withFlow(async (pay) => {
+    const pago = await api('POST', `/cobros/${cobros.body[0].id}/pagar`, { token: tokens.coach });
+    assert.equal(pago.status, 201, JSON.stringify(pago.body));
+    await pay(pago.body.url);
+  });
+  const despues = await api('GET', '/cobros', { token: tokens.coach });
+  assert.equal(despues.body[0].estado, 'PAGADO');
+});
+
+test('oficiales: informe arbitral, liquidación sin doble pago, pago y confirmación', opts, async () => {
+  const id = ctx.uPartido.id;
+  await api('POST', `/partidos/${id}/iniciar`, { token: tokens.estadigrafo, body: { alineacion: { home: [ctx.uPlayers.home], away: [ctx.uPlayers.away] } } });
+  await api('POST', `/partidos/${id}/eventos`, { token: tokens.estadigrafo, body: { tipo: 'GOL', lado: 'LOCAL', jugador_id: ctx.uPlayers.home } });
+  assert.equal((await api('POST', `/partidos/${id}/finalizar`, { token: tokens.estadigrafo })).status, 200);
+
+  const tokenArbitro = (await api('POST', '/auth/login', { body: { correo: 'arbitro@statshub.cl', password: 'Clave-Arbitro-2026' } })).body.token;
+  assert.equal((await api('POST', `/partidos/${id}/informe`, { token: tokens.estadigrafo, body: { informe: 'x' } })).status, 403, 'solo el árbitro valida');
+  const informe = await api('POST', `/partidos/${id}/informe`, { token: tokenArbitro, body: { informe: 'Partido sin incidentes.' } });
+  assert.equal(informe.status, 200, JSON.stringify(informe.body));
+  assert.equal((await api('GET', `/partidos/${id}/informe`, { token: tokens.ultra })).body.informe_arbitral, 'Partido sin incidentes.');
+  assert.equal((await api('GET', `/partidos/${id}/informe`, { token: tokens.coach })).status, 403, 'el público no ve el informe');
+
+  // Tarifas: acordada en el torneo para el árbitro; la del perfil para el estadígrafo.
+  assert.equal((await api('PUT', `/torneos/${ctx.ultraTorneo.id}/oficiales/${ctx.arbitro.id}`, { token: tokens.ultra, body: { tarifa: 15000 } })).status, 200);
+  await api('PUT', '/auth/me', { token: tokens.estadigrafo, body: { tarifaPartido: 8000 } });
+
+  const pend = await api('GET', `/liquidaciones/pendientes?oficial_id=${ctx.arbitro.id}&torneo_id=${ctx.ultraTorneo.id}`, { token: tokens.ultra });
+  assert.equal(pend.body.cantidad, 1, JSON.stringify(pend.body));
+  assert.equal(pend.body.total, 15000);
+  const stats = await api('GET', `/liquidaciones/pendientes?oficial_id=${ctx.estadigrafo.id}&torneo_id=${ctx.ultraTorneo.id}`, { token: tokens.ultra });
+  assert.equal(stats.body.total, 8000);
+
+  const liq = await api('POST', '/liquidaciones', { token: tokens.ultra, body: { oficial_id: ctx.arbitro.id, torneo_id: ctx.ultraTorneo.id } });
+  assert.equal(liq.status, 201, JSON.stringify(liq.body));
+  assert.equal(Number(liq.body.monto_total), 15000);
+  assert.equal((await api('POST', '/liquidaciones', { token: tokens.ultra, body: { oficial_id: ctx.arbitro.id, torneo_id: ctx.ultraTorneo.id } })).status, 409, 'no se paga dos veces el mismo partido');
+
+  const mis = await api('GET', '/liquidaciones', { token: tokenArbitro });
+  assert.ok(mis.body.some((l) => l.id === liq.body.id));
+  assert.equal((await api('POST', `/liquidaciones/${liq.body.id}/confirmar`, { token: tokenArbitro, body: { conforme: true } })).status, 409, 'aún no está pagada');
+  const pagada = await api('POST', `/liquidaciones/${liq.body.id}/pagar`, { token: tokens.ultra, body: { medio_pago: 'Transferencia', referencia: 'OP-123' } });
+  assert.equal(pagada.body.estado, 'PAGADA');
+  const recibida = await api('POST', `/liquidaciones/${liq.body.id}/confirmar`, { token: tokenArbitro, body: { conforme: true } });
+  assert.equal(recibida.body.estado, 'RECIBIDA');
 });
