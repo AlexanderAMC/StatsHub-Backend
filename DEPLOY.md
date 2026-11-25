@@ -64,7 +64,14 @@ CREATE ROLE statshub_app LOGIN PASSWORD '<contraseña larga y aleatoria>';
 GRANT CONNECT ON DATABASE statshub_deportivo TO statshub_app;
 ```
 
-2. Aplicar migraciones (con el usuario administrador de RDS) y seeds:
+2. Descargar el certificado de RDS (la conexión debe ir cifrada):
+
+```bash
+sudo -u statshub curl -fsSL -o /var/www/statshub/rds-global-bundle.pem \
+  https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+```
+
+3. Aplicar migraciones (con el usuario administrador de RDS, y `DB_SSL=true` + `DB_SSL_CA` en el `.env`) y seeds:
 
 ```bash
 cd /var/www/statshub/StatsHub-Database
@@ -74,7 +81,7 @@ npm run migrate:up
 npm run seed            # roles y categorías (NO usar --demo en producción)
 ```
 
-3. Dar permisos al usuario de aplicación sobre los esquemas:
+4. Dar permisos al usuario de aplicación sobre los esquemas:
 
 ```sql
 GRANT USAGE ON SCHEMA seguridad, deportivo, pagos, auditoria, analytics TO statshub_app;
@@ -107,6 +114,7 @@ Variables de producción en `.env` (ver `.env.example`):
 | `API_PUBLIC_URL` | `https://statshub.cl` (Flow notifica a `/api/pagos/flow/confirmacion`) |
 | `TRUST_PROXY` | `1` (detrás de Nginx) |
 | `DB_*` | endpoint de RDS y usuario `statshub_app` |
+| `DB_SSL` / `DB_SSL_CA` | `true` y `/var/www/statshub/rds-global-bundle.pem` (RDS rechaza conexiones sin cifrar) |
 | `JWT_SECRET` | `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"` |
 | `UPLOADS_DIR` | `/var/www/statshub/uploads` |
 | `ML_SERVICE_URL` | `http://127.0.0.1:8000` |
@@ -145,13 +153,26 @@ comportamiento por defecto → S3 (error 403/404 → `/index.html`, código 200)
 
 ## 7. Nginx y HTTPS
 
+El certificado se obtiene **antes** de activar el sitio: la configuración ya referencia los archivos
+del certificado y `nginx -t` fallaría si aún no existen. Requiere que el DNS ya apunte al servidor.
+
 ```bash
+# 1) Certificado Let's Encrypt (RNF-06) con Nginx detenido; la renovación automática reutiliza los hooks
+sudo systemctl stop nginx
+sudo certbot certonly --standalone -d statshub.cl -d www.statshub.cl -m <tu correo> --agree-tos --no-eff-email \
+  --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx"
+
+# 2) Sitio (reemplaza statshub.cl por tu dominio si es otro)
 sudo cp /var/www/statshub/StatsHub-Backend/deploy/nginx/statshub.conf /etc/nginx/sites-available/statshub
-sudo ln -s /etc/nginx/sites-available/statshub /etc/nginx/sites-enabled/
-sudo rm /etc/nginx/sites-enabled/default
-sudo certbot --nginx -d statshub.cl -d www.statshub.cl   # certificado Let's Encrypt (RNF-06), renovación automática
-sudo nginx -t && sudo systemctl reload nginx
+sudo sed -i 's/statshub\.cl/<tu-dominio>/g' /etc/nginx/sites-available/statshub
+sudo ln -sf /etc/nginx/sites-available/statshub /etc/nginx/sites-enabled/statshub
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo chmod 755 /var/www/statshub
+sudo nginx -t && sudo systemctl start nginx
+sudo certbot renew --dry-run
 ```
+
+Guía detallada con capturas de cada consola de AWS y del dominio: `GUIA-AWS-Y-DOMINIO.md` (carpeta del workspace).
 
 La configuración ya incluye: redirección a HTTPS, HSTS, cabeceras de seguridad, proxy sin buffer para
 el tiempo real (`/api/tiempo-real`), límite de peticiones por IP y caché de los archivos estáticos.
