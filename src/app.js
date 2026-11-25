@@ -13,13 +13,12 @@ const app = express();
 // Detrás de Nginx / balanceador: req.ip toma la IP real del cliente (rate limiting y auditoría).
 if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
 
-// Orígenes permitidos para CORS (separados por coma). En desarrollo, por defecto el servidor de Vite.
-const DEFAULT_DEV_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173'];
-const allowedOrigins = process.env.FRONTEND_URL
-  ? process.env.FRONTEND_URL.split(',').map((o) => o.trim()).filter(Boolean)
-  : process.env.NODE_ENV === 'production'
-    ? []
-    : DEFAULT_DEV_ORIGINS;
+// Orígenes permitidos para CORS: FRONTEND_URL (separados por coma). Fuera de producción también se
+// acepta cualquier puerto de localhost, porque Vite cambia de puerto (5173, 5174…) si el suyo está ocupado.
+const isProduction = process.env.NODE_ENV === 'production';
+const configuredOrigins = (process.env.FRONTEND_URL || '').split(',').map((o) => o.trim()).filter(Boolean);
+const LOCAL_DEV_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\]):\d+$/;
+const isAllowedOrigin = (origin) => configuredOrigins.includes(origin) || (!isProduction && LOCAL_DEV_ORIGIN.test(origin));
 
 // Middlewares
 app.use(helmet({
@@ -30,7 +29,7 @@ app.use(
   cors({
     // Sin cabecera Origin (curl, servidor a servidor) no aplica CORS. Un origen no listado
     // no recibe cabeceras CORS y el navegador bloquea la respuesta.
-    origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)),
+    origin: (origin, callback) => callback(null, !origin || isAllowedOrigin(origin)),
   })
 );
 if (process.env.NODE_ENV !== 'test') {
