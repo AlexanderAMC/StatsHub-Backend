@@ -33,6 +33,22 @@ beforeEach(() => {
     },
   };
   pool.when(/WHERE LOWER\(u\.correo\) = \$1/, ([correo]) => ({ rows: accounts[correo] ? [accounts[correo]] : [] }));
+  // Contador de intentos fallidos y bloqueo temporal de la cuenta.
+  pool.when(/SET intentos_fallidos = \$1/, ([fallidos, bloquear, , id]) => {
+    const cuenta = Object.values(accounts).find((a) => a.id === id);
+    cuenta.intentos_fallidos = fallidos;
+    cuenta.bloqueado_hasta = bloquear ? new Date(Date.now() + 15 * 60 * 1000) : null;
+    return { rows: [] };
+  });
+  pool.when(/SET intentos_fallidos = 0, bloqueado_hasta = NULL/, () => ({ rows: [] }));
+});
+
+test('la cuenta se bloquea al 5.º intento fallido, incluso para la contraseña correcta', async () => {
+  for (let i = 0; i < 4; i += 1) assert.equal((await login({ correo: 'ana@statshub.cl', password: 'otra-clave-999' })).status, 401);
+  assert.equal((await login({ correo: 'ana@statshub.cl', password: 'otra-clave-999' })).status, 429);
+  const correcta = await login({ correo: 'ana@statshub.cl', password: PASSWORD });
+  assert.equal(correcta.status, 429);
+  assert.match(correcta.body.error, /bloqueada/);
 });
 
 const login = (body) => request(server.url, 'POST', '/api/auth/login', { body });

@@ -30,7 +30,7 @@ function runDbScript(script, args = []) {
     cwd: DB_REPO,
     env: { ...process.env, DATABASE_URL: url },
     encoding: 'utf8',
-    timeout: 180000,
+    timeout: 600000, // margen amplio para equipos lentos
   });
   assert.equal(result.status, 0, `${script} falló:\n${result.stdout}\n${result.stderr}`);
 }
@@ -106,7 +106,7 @@ test('gestión deportiva: categoría, torneo con cupos, equipos y validaciones',
 
   const torneo = await api('POST', '/torneos', {
     token: tokens.organizador,
-    body: { nombre: 'Copa Test', categoria: 'Sub-20', cupos: 2, estado: 'INSCRIPCIONES', fecha_inicio: '2026-03-01', fecha_fin: '2026-06-30', costo_inscripcion: 15000 },
+    body: { nombre: 'Copa Test', categoria: 'Sub-20', cupos: 2, estado: 'INSCRIPCIONES', fecha_inicio: '2026-03-01', fecha_fin: '2026-06-30', costo_inscripcion: 15000, deporte: 'FUTBOL' },
   });
   assert.equal(torneo.status, 201, JSON.stringify(torneo.body));
   ctx.torneo = torneo.body;
@@ -293,6 +293,41 @@ test('seguridad: recuperación de contraseña con enlace de un solo uso', opts, 
   assert.equal((await api('POST', '/auth/login', { body: { correo: 'eva@test.cl', password: 'clave-nueva-3' } })).status, 200);
 });
 
+test('seguridad: el enlace de recuperación nunca viaja en la respuesta y el nuevo anula al anterior', opts, async () => {
+  const previous = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = 'development'; // ni siquiera en desarrollo
+    const res = await api('POST', '/auth/forgot-password', { body: { correo: 'eva@test.cl' } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(Object.keys(res.body), ['mensaje'], 'solo el mensaje genérico');
+    assert.doesNotMatch(JSON.stringify(res.body), /[0-9a-f]{64}/);
+  } finally {
+    process.env.NODE_ENV = previous;
+  }
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE usado_en IS NULL)::int AS vigentes FROM seguridad.password_resets pr
+     JOIN seguridad.usuarios u ON u.id = pr.usuario_id WHERE u.correo = 'eva@test.cl'`);
+  assert.equal(rows[0].vigentes, 1, 'solo el último enlace sigue vigente');
+});
+
+test('seguridad: 5 intentos fallidos bloquean la cuenta aunque luego se use la contraseña correcta', opts, async () => {
+  const reg = await api('POST', '/auth/register', { body: { nombre: 'Lola', apellido: 'Lock', correo: 'lola@test.cl', password: 'clave-segura-5', aceptaPrivacidad: true } });
+  assert.equal(reg.status, 201, JSON.stringify(reg.body));
+  const intento = (password) => api('POST', '/auth/login', { body: { correo: 'lola@test.cl', password } });
+  for (let i = 0; i < 4; i += 1) assert.equal((await intento('mala-clave-1')).status, 401);
+  const quinto = await intento('mala-clave-1');
+  assert.equal(quinto.status, 429);
+  assert.match(quinto.body.error, /bloqueada/);
+  assert.equal((await intento('clave-segura-5')).status, 429, 'bloqueada incluso con la contraseña correcta');
+
+  await pool.query(`UPDATE seguridad.usuarios SET bloqueado_hasta = now() - interval '1 minute' WHERE correo = 'lola@test.cl'`);
+  assert.equal((await intento('clave-segura-5')).status, 200, 'al vencer el bloqueo vuelve a entrar');
+
+  const debil = await api('POST', '/auth/register', { body: { nombre: 'Debi', apellido: 'L', correo: 'debil@test.cl', password: 'solamente-letras', aceptaPrivacidad: true } });
+  assert.equal(debil.status, 400);
+  assert.match(debil.body.error, /letras y números/);
+});
+
 test('administración: crear y editar usuarios con rol', opts, async () => {
   const nuevo = await api('POST', '/auth/users', { token: tokens.admin, body: { nombre: 'Sergio', apellido: 'Stats', correo: 'sergio@test.cl', password: 'clave-segura-9', rol: 'estadigrafo' } });
   assert.equal(nuevo.status, 201);
@@ -454,7 +489,7 @@ test('planes: el espectador no ve estadísticas avanzadas; con el plan Ultra se 
 test('propiedad: el organizador Ultra gestiona solo sus torneos', opts, async () => {
   const torneo = await api('POST', '/torneos', {
     token: tokens.ultra,
-    body: { nombre: 'Liga Ultra', categoria: 'Adulto', cupos: 4, estado: 'ACTIVO', fecha_inicio: '2026-03-01' },
+    body: { nombre: 'Liga Ultra', categoria: 'Adulto', cupos: 4, estado: 'ACTIVO', fecha_inicio: '2026-03-01', deporte: 'FUTBOL' },
   });
   assert.equal(torneo.status, 201, JSON.stringify(torneo.body));
   assert.ok(torneo.body.organizador_id);
@@ -544,4 +579,102 @@ test('oficiales: informe arbitral, liquidación sin doble pago, pago y confirmac
   assert.equal(pagada.body.estado, 'PAGADA');
   const recibida = await api('POST', `/liquidaciones/${liq.body.id}/confirmar`, { token: tokenArbitro, body: { conforme: true } });
   assert.equal(recibida.body.estado, 'RECIBIDA');
+});
+
+test('básquetbol: acta con puntos, faltas, cambios y tiempos muertos; tabla FIBA y estadísticas', opts, async () => {
+  const org = { token: tokens.organizador };
+  const torneo = await api('POST', '/torneos', { ...org, body: { nombre: 'Liga Básquet Test', categoria: 'Adulto', cupos: 4, estado: 'ACTIVO', fecha_inicio: '2026-04-01' } });
+  assert.equal(torneo.status, 201, JSON.stringify(torneo.body));
+  assert.equal(torneo.body.deporte, 'BASQUETBOL', 'los torneos nuevos son de básquetbol por defecto');
+
+  const team = async (nombre) => {
+    const r = await api('POST', '/equipos', { ...org, body: { nombre, torneo_id: torneo.body.id } });
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    return r.body;
+  };
+  const home = await team('Toros del Aro');
+  const away = await team('Cóndores del Aro');
+  const roster = async (equipo, base) => {
+    const ids = [];
+    for (let i = 0; i < 6; i += 1) {
+      const r = await api('POST', '/jugadores', { ...org, body: { nombre: `Basquetbolista ${base + i}`, numero: base + i, posicion: 'Base', equipo_id: equipo.id } });
+      assert.equal(r.status, 201, JSON.stringify(r.body));
+      ids.push(r.body.id);
+    }
+    return ids;
+  };
+  const h = await roster(home, 10);
+  const a = await roster(away, 20);
+
+  const partido = await api('POST', '/partidos', { ...org, body: { torneo_id: torneo.body.id, equipo_local: home.id, equipo_visita: away.id, fecha: '2026-04-04', hora: '19:00', cancha: 'Gimnasio' } });
+  assert.equal(partido.status, 201, JSON.stringify(partido.body));
+  const id = partido.body.id;
+  const ev = (body) => api('POST', `/partidos/${id}/eventos`, { ...org, body });
+  const score = async () => {
+    const p = (await api('GET', '/partidos')).body.find((m) => m.id === id);
+    return [p.goles_local, p.goles_visita];
+  };
+
+  const start = await api('POST', `/partidos/${id}/iniciar`, { ...org, body: { alineacion: { home: h.slice(0, 5), away: a.slice(0, 5) } } });
+  assert.equal(start.status, 200, JSON.stringify(start.body));
+  assert.equal(start.body.deporte, 'BASQUETBOL');
+  assert.equal((await ev({ tipo: 'GOL', lado: 'LOCAL', jugador_id: h[0] })).status, 400, 'un gol no existe en básquetbol');
+
+  assert.equal((await api('PUT', `/partidos/${id}/minuto`, { ...org, body: { periodo: 1, minuto: 11 } })).status, 400, 'un cuarto dura 10 minutos');
+  assert.equal((await api('PUT', `/partidos/${id}/minuto`, { ...org, body: { periodo: 1, minuto: 4 } })).status, 200);
+
+  const triple = await ev({ tipo: 'PUNTO_3', lado: 'LOCAL', jugador_id: h[0], asistencia_id: h[1] });
+  assert.equal(triple.status, 201, JSON.stringify(triple.body));
+  assert.equal(triple.body[0].periodo, 1);
+  await ev({ tipo: 'PUNTO_2', lado: 'VISITA', jugador_id: a[0] });
+  await ev({ tipo: 'PUNTO_1', lado: 'LOCAL', jugador_id: h[2] });
+  assert.deepEqual(await score(), [4, 2], 'libre = 1, doble = 2, triple = 3');
+  assert.equal((await ev({ tipo: 'PUNTO_2', lado: 'LOCAL', jugador_id: h[5] })).status, 409, 'un suplente no anota');
+
+  // Quinta falta: el jugador queda eliminado.
+  for (let i = 0; i < 5; i += 1) assert.equal((await ev({ tipo: 'FALTA', lado: 'VISITA', jugador_id: a[1] })).status, 201);
+  assert.equal((await ev({ tipo: 'FALTA', lado: 'VISITA', jugador_id: a[1] })).status, 409, 'con 5 faltas queda eliminado');
+  assert.equal((await ev({ tipo: 'SUSTITUCION', lado: 'VISITA', jugador_id: a[2], relacionado_id: a[1] })).status, 409, 'un eliminado no vuelve a entrar');
+
+  // Cambios ilimitados y con reingreso.
+  assert.equal((await ev({ tipo: 'SUSTITUCION', lado: 'VISITA', jugador_id: a[2], relacionado_id: a[5] })).status, 201);
+  assert.equal((await ev({ tipo: 'SUSTITUCION', lado: 'VISITA', jugador_id: a[5], relacionado_id: a[2] })).status, 201, 'en básquetbol se puede volver a entrar');
+
+  // Tiempos muertos: 2 en la primera mitad, 3 en la segunda.
+  assert.equal((await ev({ tipo: 'TIEMPO_MUERTO', lado: 'LOCAL' })).status, 201);
+  assert.equal((await ev({ tipo: 'TIEMPO_MUERTO', lado: 'LOCAL' })).status, 201);
+  assert.equal((await ev({ tipo: 'TIEMPO_MUERTO', lado: 'LOCAL' })).status, 409);
+  await api('PUT', `/partidos/${id}/minuto`, { ...org, body: { periodo: 3, minuto: 2 } });
+  assert.equal((await ev({ tipo: 'TIEMPO_MUERTO', lado: 'LOCAL' })).status, 201, 'la segunda mitad trae tiempos nuevos');
+
+  await ev({ tipo: 'REBOTE', lado: 'LOCAL', jugador_id: h[0] });
+  await ev({ tipo: 'PUNTO_2', lado: 'VISITA', jugador_id: a[0] });
+  assert.deepEqual(await score(), [4, 4]);
+  assert.equal((await api('POST', `/partidos/${id}/finalizar`, org)).status, 409, 'no termina empatado');
+  await ev({ tipo: 'PUNTO_3', lado: 'VISITA', jugador_id: a[3] });
+  assert.equal((await api('DELETE', `/partidos/${id}/eventos/ultimo`, org)).status, 204);
+  assert.deepEqual(await score(), [4, 4], 'deshacer un triple descuenta 3');
+  await ev({ tipo: 'PUNTO_1', lado: 'LOCAL', jugador_id: h[3] });
+  const fin = await api('POST', `/partidos/${id}/finalizar`, org);
+  assert.equal(fin.status, 200, JSON.stringify(fin.body));
+
+  const tabla = (await api('GET', `/estadisticas/posiciones?torneo_id=${torneo.body.id}`)).body;
+  assert.deepEqual(tabla.map((r) => [r.equipo_id, r.pts, r.pe]), [[home.id, 2, 0], [away.id, 1, 0]], 'FIBA: 2 por victoria, 1 por derrota');
+
+  const anotadores = (await api('GET', `/estadisticas/goleadores?torneo_id=${torneo.body.id}`, org)).body;
+  assert.equal(anotadores[0].jugador_id, a[0]);
+  assert.equal(anotadores[0].total, 4);
+  assert.equal(anotadores[0].promedio, 4);
+  assert.equal(anotadores.find((r) => r.jugador_id === h[0]).triples, 1);
+  assert.equal((await api('GET', `/estadisticas/asistencias?torneo_id=${torneo.body.id}`, org)).body[0].jugador_id, h[1]);
+  assert.equal((await api('GET', `/estadisticas/rebotes?torneo_id=${torneo.body.id}`, org)).body[0].jugador_id, h[0]);
+  const fair = (await api('GET', `/estadisticas/fair-play?torneo_id=${torneo.body.id}`, org)).body;
+  assert.equal(fair.find((r) => r.equipo_id === away.id).faltas, 5);
+
+  await api('POST', '/partidos', { ...org, body: { torneo_id: torneo.body.id, equipo_local: away.id, equipo_visita: home.id, fecha: '2026-04-11', hora: '19:00', cancha: 'Gimnasio' } });
+  const pred = (await api('GET', `/estadisticas/predicciones?torneo_id=${torneo.body.id}`, org)).body;
+  assert.equal(pred.length, 1);
+  assert.equal(pred[0].modelo, 'normal-basquetbol-node');
+  assert.equal(pred[0].empate, 0, 'en básquetbol no hay empate');
+  assert.ok(Math.abs(pred[0].local + pred[0].visita - 1) < 1e-9);
 });

@@ -43,6 +43,7 @@ router.get('/estadisticas/posiciones', estadisticas.posiciones);
 // Estadísticas avanzadas: plan Básico o superior. Predicción con ML: plan Pro o superior.
 router.get('/estadisticas/goleadores', ...can(P.STATS_ADVANCED), estadisticas.goleadores);
 router.get('/estadisticas/asistencias', ...can(P.STATS_ADVANCED), estadisticas.asistencias);
+router.get('/estadisticas/rebotes', ...can(P.STATS_ADVANCED), estadisticas.rebotes);
 router.get('/estadisticas/fair-play', ...can(P.STATS_ADVANCED), estadisticas.fairPlay);
 router.get('/estadisticas/predicciones', ...can(P.ANALYTICS), estadisticas.predicciones);
 router.get('/estadisticas/equipos/:id/rendimiento', ...can(P.STATS_ADVANCED), estadisticas.rendimientoEquipo);

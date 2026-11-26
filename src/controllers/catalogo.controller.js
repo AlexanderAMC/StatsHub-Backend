@@ -1,4 +1,5 @@
 const pool = require('../config/database');
+const { SPORTS, BASQUETBOL } = require('../config/sports');
 const { audit } = require('../utils/audit');
 const { badRequest, notFound, conflict, PG_ERRORS } = require('../utils/errors');
 const { positiveInt, text, date, oneOf } = require('../utils/http');
@@ -92,7 +93,7 @@ const deleteCategoria = async (req, res) => {
 // ===================== TORNEOS (RF-09, RF-11) =====================
 
 const TOURNAMENT_SQL = `
-  SELECT t.id, t.nombre, t.fecha_inicio, t.fecha_fin, t.estado, t.cupos, t.formato, t.costo_inscripcion, t.organizador_id,
+  SELECT t.id, t.nombre, t.deporte, t.fecha_inicio, t.fecha_fin, t.estado, t.cupos, t.formato, t.costo_inscripcion, t.organizador_id,
          t.categoria_id, c.nombre AS categoria,
          COUNT(te.equipo_id)::int AS cantidad_equipos
   FROM deportivo.torneos t
@@ -117,7 +118,8 @@ async function resolveCategoria(body) {
   return rows[0].id;
 }
 
-function parseTorneo(body) {
+function parseTorneo(body, { defaultSport = BASQUETBOL } = {}) {
+  const deporte = oneOf(body.deporte ?? defaultSport, SPORTS, 'El deporte');
   const nombre = text(body.nombre, 'El nombre del torneo', { max: 200 });
   const fechaInicio = date(body.fecha_inicio, 'La fecha de inicio');
   const fechaFin = date(body.fecha_fin, 'La fecha de término', { required: false });
@@ -131,7 +133,7 @@ function parseTorneo(body) {
     costo = Number(body.costo_inscripcion);
     if (!Number.isInteger(costo) || costo < 0) throw badRequest('El costo de inscripción debe ser un entero mayor o igual a 0');
   }
-  return { nombre, fechaInicio, fechaFin, cupos, estado, formato, costo };
+  return { nombre, deporte, fechaInicio, fechaFin, cupos, estado, formato, costo };
 }
 
 const createTorneo = async (req, res) => {
@@ -139,10 +141,10 @@ const createTorneo = async (req, res) => {
   const categoriaId = await resolveCategoria(req.body ?? {});
   try {
     const { rows } = await pool.query(
-      `INSERT INTO deportivo.torneos (nombre, categoria_id, fecha_inicio, fecha_fin, estado, cupos, formato, costo_inscripcion, organizador_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      `INSERT INTO deportivo.torneos (nombre, categoria_id, fecha_inicio, fecha_fin, estado, cupos, formato, costo_inscripcion, organizador_id, deporte)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
       // Torneo de la liga (NULL) si lo crea la administración; si no, queda a nombre del organizador del plan Ultra.
-      [t.nombre, categoriaId, t.fechaInicio, t.fechaFin, t.estado, t.cupos, t.formato, t.costo, isLeagueManager(req.user) ? null : req.user.id]
+      [t.nombre, categoriaId, t.fechaInicio, t.fechaFin, t.estado, t.cupos, t.formato, t.costo, isLeagueManager(req.user) ? null : req.user.id, t.deporte]
     );
     audit(req, { accion: 'CREAR_TORNEO', tabla: 'deportivo.torneos', registroId: rows[0].id, detalle: { nombre: t.nombre } });
     res.status(201).json(await getTorneo(rows[0].id));
@@ -160,15 +162,19 @@ const updateTorneo = async (req, res) => {
   // RF-11: un torneo finalizado o cancelado ya no se modifica.
   if (['FINALIZADO', 'CANCELADO'].includes(actual.estado)) throw conflict(`El torneo está ${actual.estado.toLowerCase()} y no se puede editar`);
 
-  const t = parseTorneo(req.body ?? {});
+  const t = parseTorneo(req.body ?? {}, { defaultSport: actual.deporte });
   const categoriaId = await resolveCategoria(req.body ?? {});
+  if (t.deporte !== actual.deporte) {
+    const { rows: jugados } = await pool.query('SELECT 1 FROM deportivo.partidos WHERE torneo_id = $1 LIMIT 1', [id]);
+    if (jugados.length > 0) throw conflict('No se puede cambiar el deporte de un torneo que ya tiene partidos');
+  }
   if (t.cupos < actual.cantidad_equipos) throw conflict(`El torneo ya tiene ${actual.cantidad_equipos} equipos inscritos`);
   try {
     await pool.query(
       `UPDATE deportivo.torneos
-       SET nombre = $1, categoria_id = $2, fecha_inicio = $3, fecha_fin = $4, estado = $5, cupos = $6, formato = $7, costo_inscripcion = $8
+       SET nombre = $1, categoria_id = $2, fecha_inicio = $3, fecha_fin = $4, estado = $5, cupos = $6, formato = $7, costo_inscripcion = $8, deporte = $10
        WHERE id = $9`,
-      [t.nombre, categoriaId, t.fechaInicio, t.fechaFin, t.estado, t.cupos, t.formato, t.costo, id]
+      [t.nombre, categoriaId, t.fechaInicio, t.fechaFin, t.estado, t.cupos, t.formato, t.costo, id, t.deporte]
     );
     audit(req, { accion: t.estado === 'CANCELADO' ? 'CANCELAR_TORNEO' : 'EDITAR_TORNEO', tabla: 'deportivo.torneos', registroId: id });
     res.json(await getTorneo(id));

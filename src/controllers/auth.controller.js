@@ -7,7 +7,7 @@ const jwt = require('jsonwebtoken');
 const { getJwtSecret, JWT_ALGORITHM, JWT_EXPIRES_IN } = require('../config/jwt');
 const { ROLES, DEFAULT_ROLE, ASSIGNABLE_ROLES, normalizeRole } = require('../config/roles');
 const { effectivePermissions } = require('../config/permissions');
-const { isUuid, isValidEmail, normalizeEmail, validateLogin, validateRegister } = require('../utils/validators');
+const { isUuid, isValidEmail, normalizeEmail, validateLogin, validateRegister, passwordProblem } = require('../utils/validators');
 const { badRequest } = require('../utils/errors');
 
 const BCRYPT_ROUNDS = 12;
@@ -20,7 +20,18 @@ const USER_STATUSES = ['activo', 'bloqueado'];
 const DUMMY_HASH = bcrypt.hashSync('statshub-usuario-inexistente', BCRYPT_ROUNDS);
 
 const INVALID_CREDENTIALS = 'Credenciales inválidas';
-const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hora
+const RESET_TOKEN_TTL_MS = 30 * 60 * 1000; // 30 minutos
+// Bloqueo de la cuenta tras intentos fallidos (independiente de la IP).
+const MAX_FAILED_LOGINS = 5;
+const LOCK_MINUTES = 15;
+const LOCKED_MESSAGE = `Por seguridad, la cuenta quedó bloqueada ${LOCK_MINUTES} minutos tras varios intentos fallidos. Si no fuiste tú, restablece tu contraseña.`;
+
+// Aviso al titular cada vez que cambia su contraseña (si no fue él, sabe que debe reaccionar).
+const notifyPasswordChanged = (correo, nombre) => sendMail({
+  to: correo,
+  subject: 'Tu contraseña de StatsHub Deportivo cambió',
+  text: `Hola ${nombre}:\n\nLa contraseña de tu cuenta se cambió el ${new Date().toLocaleString('es-CL', { timeZone: 'America/Santiago' })}. Todas las sesiones abiertas se cerraron.\n\nSi no fuiste tú, restablece tu contraseña de inmediato y avisa a la administración de la liga.`,
+}).catch((error) => console.error('No se pudo enviar el aviso de cambio de contraseña:', error.message));
 
 // El JWT lleva la versión del token (tv): al cerrar sesión o cambiar la contraseña se
 // incrementa en la BD y todos los tokens anteriores quedan inválidos (RF-02).
@@ -69,7 +80,7 @@ const login = async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT u.id, u.nombre, u.apellido, u.correo, u.password_hash, u.activo, u.token_version,
-              u.acepta_privacidad_en, r.nombre AS rol
+              u.acepta_privacidad_en, u.intentos_fallidos, u.bloqueado_hasta, r.nombre AS rol
        FROM seguridad.usuarios u
        JOIN seguridad.roles r ON u.rol_id = r.id
        WHERE LOWER(u.correo) = $1`,
@@ -78,8 +89,27 @@ const login = async (req, res) => {
     const usuario = result.rows[0];
 
     const passwordValido = await bcrypt.compare(password, usuario ? usuario.password_hash : DUMMY_HASH);
+    // Cuenta bloqueada por intentos fallidos: se rechaza incluso con la contraseña correcta.
+    if (usuario?.bloqueado_hasta && new Date(usuario.bloqueado_hasta) > new Date()) {
+      return res.status(429).json({ error: LOCKED_MESSAGE });
+    }
     if (!usuario || !passwordValido) {
+      if (usuario) {
+        const fallidos = (usuario.intentos_fallidos ?? 0) + 1;
+        const bloquear = fallidos >= MAX_FAILED_LOGINS;
+        await pool.query(
+          `UPDATE seguridad.usuarios
+           SET intentos_fallidos = $1, bloqueado_hasta = CASE WHEN $2 THEN now() + make_interval(mins => $3) ELSE NULL END
+           WHERE id = $4`,
+          [bloquear ? 0 : fallidos, bloquear, LOCK_MINUTES, usuario.id]
+        );
+        audit(req, { accion: bloquear ? 'BLOQUEO_CUENTA' : 'LOGIN_FALLIDO', tabla: 'seguridad.usuarios', registroId: usuario.id, usuarioId: usuario.id });
+        if (bloquear) return res.status(429).json({ error: LOCKED_MESSAGE });
+      }
       return res.status(401).json({ error: INVALID_CREDENTIALS });
+    }
+    if (usuario.intentos_fallidos || usuario.bloqueado_hasta) {
+      await pool.query('UPDATE seguridad.usuarios SET intentos_fallidos = 0, bloqueado_hasta = NULL WHERE id = $1', [usuario.id]);
     }
 
     // Solo se informa del bloqueo a quien ya demostró conocer la contraseña.
@@ -336,21 +366,42 @@ const updateMe = async (req, res) => {
 // 9. CAMBIAR CONTRASEÑA: exige la actual e invalida las demás sesiones.
 const changePassword = async (req, res) => {
   const { actual, nueva } = req.body ?? {};
-  const errors = validateRegister({ nombre: 'x', apellido: 'x', correo: 'a@b.cl', password: nueva });
   if (typeof actual !== 'string' || !actual) throw badRequest('Ingresa tu contraseña actual');
-  if (errors.length > 0) throw badRequest(errors[0]);
 
-  const { rows } = await pool.query('SELECT password_hash FROM seguridad.usuarios WHERE id = $1', [req.user.id]);
-  if (!(await bcrypt.compare(actual, rows[0].password_hash))) {
+  const { rows } = await pool.query(
+    'SELECT password_hash, correo, nombre, intentos_fallidos, bloqueado_hasta FROM seguridad.usuarios WHERE id = $1',
+    [req.user.id]
+  );
+  const yo = rows[0];
+  if (yo.bloqueado_hasta && new Date(yo.bloqueado_hasta) > new Date()) return res.status(429).json({ error: LOCKED_MESSAGE });
+  if (!(await bcrypt.compare(actual, yo.password_hash))) {
+    // Una sesión robada no sirve para adivinar la contraseña: los fallos cuentan para el bloqueo,
+    // y al bloquearse se cierran todas las sesiones.
+    const fallidos = (yo.intentos_fallidos ?? 0) + 1;
+    const bloquear = fallidos >= MAX_FAILED_LOGINS;
+    await pool.query(
+      `UPDATE seguridad.usuarios
+       SET intentos_fallidos = $1,
+           bloqueado_hasta = CASE WHEN $2 THEN now() + make_interval(mins => $3) ELSE NULL END,
+           token_version = token_version + CASE WHEN $2 THEN 1 ELSE 0 END
+       WHERE id = $4`,
+      [bloquear ? 0 : fallidos, bloquear, LOCK_MINUTES, req.user.id]
+    );
+    if (bloquear) return res.status(429).json({ error: LOCKED_MESSAGE });
     return res.status(400).json({ error: 'La contraseña actual no es correcta' });
   }
+  const problem = passwordProblem(nueva, yo.correo);
+  if (problem) throw badRequest(problem);
+  if (actual === nueva) throw badRequest('La nueva contraseña debe ser distinta de la actual');
   const hash = await bcrypt.hash(nueva, BCRYPT_ROUNDS);
   const updated = await pool.query(
-    `UPDATE seguridad.usuarios SET password_hash = $1, token_version = token_version + 1
+    `UPDATE seguridad.usuarios
+     SET password_hash = $1, token_version = token_version + 1, intentos_fallidos = 0, bloqueado_hasta = NULL, password_cambiado_en = now()
      WHERE id = $2 RETURNING id, token_version, (SELECT nombre FROM seguridad.roles WHERE id = rol_id) AS rol`,
     [hash, req.user.id]
   );
   audit(req, { accion: 'CAMBIO_PASSWORD', tabla: 'seguridad.usuarios', registroId: req.user.id });
+  notifyPasswordChanged(yo.correo, yo.nombre);
   // Se entrega un token nuevo para que esta sesión siga activa; las demás quedan cerradas.
   return res.json({ mensaje: 'Contraseña actualizada', token: signToken(updated.rows[0]) });
 };
@@ -368,6 +419,8 @@ const forgotPassword = async (req, res) => {
   );
   if (rows.length > 0) {
     const token = crypto.randomBytes(32).toString('hex');
+    // Solo vale el último enlace: los anteriores quedan anulados.
+    await pool.query('UPDATE seguridad.password_resets SET usado_en = now() WHERE usuario_id = $1 AND usado_en IS NULL', [rows[0].id]);
     await pool.query(
       `INSERT INTO seguridad.password_resets (usuario_id, token_hash, expira_en) VALUES ($1, $2, $3)`,
       [rows[0].id, sha256(token), new Date(Date.now() + RESET_TOKEN_TTL_MS)]
@@ -377,7 +430,7 @@ const forgotPassword = async (req, res) => {
     await sendMail({
       to: correo,
       subject: 'Restablecer tu contraseña de StatsHub Deportivo',
-      text: `Hola ${rows[0].nombre}:\n\nPara crear una nueva contraseña abre este enlace (válido por 1 hora):\n${link}\n\nSi no lo solicitaste, ignora este correo.`,
+      text: `Hola ${rows[0].nombre}:\n\nPara crear una nueva contraseña abre este enlace (válido por 30 minutos y de un solo uso):\n${link}\n\nSi no lo solicitaste, ignora este correo: tu contraseña no cambia.`,
     });
     audit(req, { accion: 'SOLICITUD_RESET_PASSWORD', tabla: 'seguridad.usuarios', registroId: rows[0].id, usuarioId: rows[0].id });
   }
@@ -387,8 +440,6 @@ const forgotPassword = async (req, res) => {
 const resetPassword = async (req, res) => {
   const { token, password } = req.body ?? {};
   if (typeof token !== 'string' || !/^[0-9a-f]{64}$/.test(token)) throw badRequest('El enlace no es válido');
-  const errors = validateRegister({ nombre: 'x', apellido: 'x', correo: 'a@b.cl', password });
-  if (errors.length > 0) throw badRequest(errors[0]);
 
   const client = await pool.connect();
   try {
@@ -403,9 +454,21 @@ const resetPassword = async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'El enlace expiró o ya fue utilizado. Solicita uno nuevo.' });
     }
+    const { rows: [titular] } = await client.query('SELECT correo, nombre, password_hash FROM seguridad.usuarios WHERE id = $1', [rows[0].usuario_id]);
+    const problem = passwordProblem(password, titular.correo);
+    if (problem) {
+      await client.query('ROLLBACK');
+      throw badRequest(problem);
+    }
+    if (await bcrypt.compare(password, titular.password_hash)) {
+      await client.query('ROLLBACK');
+      throw badRequest('La nueva contraseña debe ser distinta de la anterior');
+    }
     const hash = await bcrypt.hash(password, BCRYPT_ROUNDS);
     await client.query(
-      'UPDATE seguridad.usuarios SET password_hash = $1, token_version = token_version + 1 WHERE id = $2',
+      `UPDATE seguridad.usuarios
+       SET password_hash = $1, token_version = token_version + 1, intentos_fallidos = 0, bloqueado_hasta = NULL, password_cambiado_en = now()
+       WHERE id = $2`,
       [hash, rows[0].usuario_id]
     );
     // Un solo uso: se invalidan todos los enlaces pendientes del usuario.
@@ -415,6 +478,7 @@ const resetPassword = async (req, res) => {
     );
     await client.query('COMMIT');
     audit(req, { accion: 'RESET_PASSWORD', tabla: 'seguridad.usuarios', registroId: rows[0].usuario_id, usuarioId: rows[0].usuario_id });
+    notifyPasswordChanged(titular.correo, titular.nombre);
     return res.json({ mensaje: 'Tu contraseña fue actualizada. Ya puedes iniciar sesión.' });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});

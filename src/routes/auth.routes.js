@@ -3,14 +3,14 @@ const router = express.Router();
 
 const auth = require('../controllers/auth.controller');
 const { authenticate, requirePermission } = require('../middleware/auth');
-const { loginLimiter, registerLimiter, forgotLimiter } = require('../middleware/rateLimit');
+const { loginLimiter, registerLimiter, forgotLimiter, forgotEmailLimiter, resetLimiter } = require('../middleware/rateLimit');
 const { PERMISSIONS } = require('../config/permissions');
 
 // Rutas públicas de autenticación (con límite de intentos)
 router.post('/login', loginLimiter, auth.login);
 router.post('/register', registerLimiter, auth.register);
-router.post('/forgot-password', forgotLimiter, auth.forgotPassword);
-router.post('/reset-password', forgotLimiter, auth.resetPassword);
+router.post('/forgot-password', forgotLimiter, forgotEmailLimiter, auth.forgotPassword);
+router.post('/reset-password', resetLimiter, auth.resetPassword);
 
 // Sesión propia
 router.post('/logout', authenticate, auth.logout);

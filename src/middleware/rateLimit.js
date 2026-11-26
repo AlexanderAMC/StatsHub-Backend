@@ -70,4 +70,19 @@ const uploadLimiter = createRateLimiter({
   message: 'Demasiadas subidas de archivos. Intenta en unos minutos.',
 });
 
-module.exports = { createRateLimiter, loginLimiter, registerLimiter, forgotLimiter, uploadLimiter };
+// Por correo (además de por IP): nadie puede inundar de solicitudes la cuenta de otra persona.
+const forgotEmailLimiter = createRateLimiter({
+  windowMs: ONE_HOUR,
+  max: 3,
+  keyGenerator: (req) => `correo|${typeof req.body?.correo === 'string' ? req.body.correo.trim().toLowerCase() : ''}`,
+  message: 'Ya se enviaron varias solicitudes para este correo. Revisa tu bandeja o intenta en una hora.',
+});
+
+// Uso del enlace: frena que alguien pruebe tokens al azar.
+const resetLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MINUTES,
+  max: 10,
+  message: 'Demasiados intentos de restablecimiento. Intenta en unos minutos.',
+});
+
+module.exports = { createRateLimiter, loginLimiter, registerLimiter, forgotLimiter, forgotEmailLimiter, resetLimiter, uploadLimiter };

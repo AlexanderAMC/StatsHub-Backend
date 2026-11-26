@@ -89,4 +89,58 @@ async function predict(history, fixtures) {
   return localPoisson(history, fixtures);
 }
 
-module.exports = { predict, localPoisson, outcome };
+// Básquetbol: los puntos de cada equipo se aproximan con una normal. El marcador esperado sale de
+// la fuerza ofensiva y defensiva (como en fútbol) más la ventaja de local; no hay empates
+// (se juega prórroga), así que la probabilidad se reparte solo entre local y visita.
+const BASKET_HOME_POINTS = 3;
+const BASKET_SD = 11; // desviación típica de los puntos de un equipo en un partido
+
+function normalCdf(x) {
+  // Aproximación de Abramowitz-Stegun de la función de error.
+  const t = 1 / (1 + 0.3275911 * Math.abs(x) / Math.SQRT2);
+  const erf = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t
+    * Math.exp(-(x * x) / 2);
+  return x >= 0 ? (1 + erf) / 2 : (1 - erf) / 2;
+}
+
+function basketballPrediction(history, fixtures) {
+  const table = new Map();
+  const row = (id) => {
+    if (!table.has(id)) table.set(id, { pf: 0, pc: 0, pj: 0 });
+    return table.get(id);
+  };
+  let points = 0;
+  for (const m of history) {
+    const h = row(m.local);
+    const a = row(m.visita);
+    h.pf += m.goles_local; h.pc += m.goles_visita; h.pj += 1;
+    a.pf += m.goles_visita; a.pc += m.goles_local; a.pj += 1;
+    points += m.goles_local + m.goles_visita;
+  }
+  const avg = history.length ? points / (2 * history.length) : 60;
+  const strength = (id) => {
+    const r = table.get(id) ?? { pf: 0, pc: 0, pj: 0 };
+    return {
+      attack: (r.pf + SMOOTHING * avg) / (r.pj + SMOOTHING) / avg,
+      defense: (r.pc + SMOOTHING * avg) / (r.pj + SMOOTHING) / avg,
+    };
+  };
+  return fixtures.map((f) => {
+    const h = strength(f.local);
+    const a = strength(f.visita);
+    const expectedHome = avg * h.attack * a.defense + BASKET_HOME_POINTS / 2;
+    const expectedAway = avg * a.attack * h.defense - BASKET_HOME_POINTS / 2;
+    const local = normalCdf((expectedHome - expectedAway) / (BASKET_SD * Math.SQRT2));
+    return {
+      partido_id: f.id,
+      local,
+      empate: 0,
+      visita: 1 - local,
+      goles_esperados_local: expectedHome,
+      goles_esperados_visita: expectedAway,
+      modelo: 'normal-basquetbol-node',
+    };
+  });
+}
+
+module.exports = { predict, localPoisson, outcome, basketballPrediction, normalCdf };

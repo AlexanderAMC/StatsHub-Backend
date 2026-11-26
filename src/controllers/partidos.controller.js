@@ -5,28 +5,30 @@ const { broadcast } = require('../realtime/hub');
 const { badRequest, notFound, conflict, AppError } = require('../utils/errors');
 const { positiveInt, text, date, time } = require('../utils/http');
 const { ROLES } = require('../config/roles');
+const { BASQUETBOL, BASKETBALL, EVENT_TYPES, scoreValue } = require('../config/sports');
 const { isUuid } = require('../utils/validators');
 const { isLeagueManager, assertTournamentAccess, assertMatchAccess, forbidden } = require('../utils/scope');
 
 const MAX_SUBSTITUTIONS = 5;
 const MAX_MINUTE = 130;
-const EVENT_TYPES = ['GOL', 'AMARILLA', 'ROJA', 'SUSTITUCION', 'LESION'];
+const MAX_PERIOD = 10;
 const SIDES = { LOCAL: 'home', VISITA: 'away' };
 const DOUBLE_YELLOW = 'DOBLE_AMARILLA';
 
 const MATCH_SQL = `
   SELECT p.id, p.torneo_id, p.jornada, p.equipo_local, p.equipo_visita, p.fecha_partido, p.cancha, p.estado,
          p.arbitro_id, p.estadigrafo_id, p.minuto, p.alineacion, p.iniciado_en, p.acta_cerrada_en,
-         p.doble_funcion, p.acta_validada_en,
+         p.doble_funcion, p.acta_validada_en, p.periodo, t.deporte,
          el.nombre AS equipo_local_nombre, ev.nombre AS equipo_visita_nombre,
          COALESCE(r.goles_local, 0) AS goles_local, COALESCE(r.goles_visita, 0) AS goles_visita
   FROM deportivo.partidos p
   JOIN deportivo.equipos el ON p.equipo_local = el.id
   JOIN deportivo.equipos ev ON p.equipo_visita = ev.id
+  JOIN deportivo.torneos t ON t.id = p.torneo_id
   LEFT JOIN deportivo.resultados r ON p.id = r.partido_id`;
 
 const EVENT_SQL = `
-  SELECT id, partido_id, jugador_id, asistencia_jugador_id, relacionado_jugador_id, tipo_evento, lado, minuto,
+  SELECT id, partido_id, jugador_id, asistencia_jugador_id, relacionado_jugador_id, tipo_evento, lado, minuto, periodo,
          descripcion, creado_en
   FROM deportivo.eventos_partido`;
 
@@ -37,7 +39,9 @@ const listPartidos = async (req, res) => {
 
 async function getPartido(id, db = pool, { lock = false } = {}) {
   const { rows } = await db.query(
-    lock ? 'SELECT * FROM deportivo.partidos WHERE id = $1 FOR UPDATE' : `${MATCH_SQL} WHERE p.id = $1`,
+    lock
+      ? 'SELECT p.*, t.deporte FROM deportivo.partidos p JOIN deportivo.torneos t ON t.id = p.torneo_id WHERE p.id = $1 FOR UPDATE OF p'
+      : `${MATCH_SQL} WHERE p.id = $1`,
     [id]
   );
   return rows[0] ?? null;
@@ -277,7 +281,7 @@ const iniciarPartido = async (req, res) => {
     }
     await db.query(
       `UPDATE deportivo.partidos
-       SET estado = 'EN_CURSO', minuto = 0, alineacion = $1, iniciado_en = now(), actualizado_en = now()
+       SET estado = 'EN_CURSO', minuto = 0, periodo = 1, alineacion = $1, iniciado_en = now(), actualizado_en = now()
        WHERE id = $2`,
       [JSON.stringify({ home, away }), id]
     );
@@ -295,28 +299,44 @@ const iniciarPartido = async (req, res) => {
 
 const setMinuto = async (req, res) => {
   const id = positiveInt(req.params.id, 'El id');
-  const minuto = Number(req.body?.minuto);
-  if (!Number.isInteger(minuto) || minuto < 0 || minuto > MAX_MINUTE) throw badRequest(`El minuto debe estar entre 0 y ${MAX_MINUTE}`);
   const partido = await getPartido(id);
   if (!partido) throw notFound('Partido no encontrado');
   assertLive(partido);
   await assertActaAccess(req, partido);
-  await pool.query('UPDATE deportivo.partidos SET minuto = $1, actualizado_en = now() WHERE id = $2', [minuto, id]);
+
+  const minuto = Number(req.body?.minuto);
+  let periodo = partido.periodo ?? 1;
+  if (partido.deporte === BASQUETBOL) {
+    // Básquetbol: cuarto (1-4, 5+ = prórroga) y minuto dentro del cuarto.
+    if (req.body?.periodo !== undefined) periodo = Number(req.body.periodo);
+    if (!Number.isInteger(periodo) || periodo < 1 || periodo > MAX_PERIOD) throw badRequest(`El cuarto debe estar entre 1 y ${MAX_PERIOD}`);
+    const max = periodo > BASKETBALL.periods ? BASKETBALL.overtimeMinutes : BASKETBALL.periodMinutes;
+    if (!Number.isInteger(minuto) || minuto < 0 || minuto > max) throw badRequest(`El minuto del cuarto debe estar entre 0 y ${max}`);
+  } else if (!Number.isInteger(minuto) || minuto < 0 || minuto > MAX_MINUTE) {
+    throw badRequest(`El minuto debe estar entre 0 y ${MAX_MINUTE}`);
+  }
+  await pool.query('UPDATE deportivo.partidos SET minuto = $1, periodo = $2, actualizado_en = now() WHERE id = $3', [minuto, periodo, id]);
   changed(id);
-  res.json({ id, minuto });
+  res.json({ id, minuto, periodo });
 };
 
-// Estado del partido según los eventos ya registrados: quién está en cancha, expulsados, amarillas y cambios.
+// Estado del partido según los eventos ya registrados: quién está en cancha, expulsados o eliminados,
+// amarillas, faltas, cambios y tiempos muertos.
 async function matchState(db, partido) {
-  const { rows: events } = await db.query(`${EVENT_SQL} WHERE partido_id = $1 ORDER BY minuto, id`, [partido.id]);
+  const { rows: events } = await db.query(`${EVENT_SQL} WHERE partido_id = $1 ORDER BY id`, [partido.id]);
   const lineup = partido.alineacion ?? { home: [], away: [] };
   const state = {
     onField: { home: new Set(lineup.home), away: new Set(lineup.away) },
     used: { home: new Set(lineup.home), away: new Set(lineup.away) },
     subs: { home: 0, away: 0 },
     yellows: new Map(),
+    fouls: new Map(),
+    technicals: new Map(),
+    unsportsmanlike: new Map(),
+    timeouts: { home: [], away: [] },
     sentOff: new Set(),
   };
+  const bump = (map, key) => map.set(key, (map.get(key) ?? 0) + 1);
   for (const e of events) {
     const side = SIDES[e.lado];
     if (!side) continue;
@@ -328,10 +348,23 @@ async function matchState(db, partido) {
       }
       state.subs[side] += 1;
     } else if (e.tipo_evento === 'AMARILLA') {
-      state.yellows.set(e.jugador_id, (state.yellows.get(e.jugador_id) ?? 0) + 1);
+      bump(state.yellows, e.jugador_id);
     } else if (e.tipo_evento === 'ROJA') {
       state.sentOff.add(e.jugador_id);
       state.onField[side].delete(e.jugador_id);
+    } else if (e.tipo_evento === 'TIEMPO_MUERTO') {
+      state.timeouts[side].push(e.periodo ?? 1);
+    } else if (BASKETBALL.fouls.includes(e.tipo_evento)) {
+      bump(state.fouls, e.jugador_id);
+      if (e.tipo_evento === 'FALTA_TECNICA') bump(state.technicals, e.jugador_id);
+      if (e.tipo_evento === 'FALTA_ANTIDEPORTIVA') bump(state.unsportsmanlike, e.jugador_id);
+      // Básquetbol: 5 faltas, 2 técnicas o 2 antideportivas eliminan al jugador del partido.
+      if ((state.fouls.get(e.jugador_id) ?? 0) >= BASKETBALL.foulOut
+        || (state.technicals.get(e.jugador_id) ?? 0) >= BASKETBALL.techOut
+        || (state.unsportsmanlike.get(e.jugador_id) ?? 0) >= BASKETBALL.techOut) {
+        state.sentOff.add(e.jugador_id);
+        state.onField[side].delete(e.jugador_id);
+      }
     }
   }
   return state;
@@ -340,31 +373,52 @@ async function matchState(db, partido) {
 const addEvento = async (req, res) => {
   const id = positiveInt(req.params.id, 'El id');
   const tipo = String(req.body?.tipo ?? '').toUpperCase();
-  if (!EVENT_TYPES.includes(tipo)) throw badRequest('Tipo de evento inválido');
   const lado = String(req.body?.lado ?? '').toUpperCase();
   if (!SIDES[lado]) throw badRequest("El lado debe ser 'LOCAL' o 'VISITA'");
-  const jugadorId = positiveInt(req.body?.jugador_id, 'El jugador');
-  const asistenciaId = tipo === 'GOL' && req.body?.asistencia_id ? positiveInt(req.body.asistencia_id, 'El asistente') : null;
-  const relacionadoId = tipo === 'SUSTITUCION' ? positiveInt(req.body?.relacionado_id, 'El jugador que entra') : null;
 
   const created = await withTransaction(async (db) => {
     const partido = await getPartido(id, db, { lock: true });
     if (!partido) throw notFound('Partido no encontrado');
+    const deporte = partido.deporte;
+    const basket = deporte === BASQUETBOL;
+    if (!EVENT_TYPES[deporte].includes(tipo)) throw badRequest(`Tipo de evento inválido para ${basket ? 'básquetbol' : 'fútbol'}`);
     assertLive(partido);
     await assertActaAccess(req, partido);
+
+    const teamEvent = tipo === 'TIEMPO_MUERTO';
+    const jugadorId = teamEvent ? null : positiveInt(req.body?.jugador_id, 'El jugador');
+    const assistable = ['GOL', 'PUNTO_2', 'PUNTO_3'].includes(tipo);
+    const asistenciaId = assistable && req.body?.asistencia_id ? positiveInt(req.body.asistencia_id, 'El asistente') : null;
+    const relacionadoId = tipo === 'SUSTITUCION' ? positiveInt(req.body?.relacionado_id, 'El jugador que entra') : null;
+
     const side = SIDES[lado];
     const equipoId = side === 'home' ? partido.equipo_local : partido.equipo_visita;
     const roster = await rosterIds(db, equipoId);
     const state = await matchState(db, partido);
+    const periodo = partido.periodo ?? 1;
 
-    if (!roster.includes(jugadorId)) throw badRequest('El jugador no pertenece a ese equipo');
-    if (state.sentOff.has(jugadorId)) throw conflict('El jugador fue expulsado y no puede registrar más eventos');
+    if (teamEvent) {
+      const [from, to] = BASKETBALL.timeoutWindow(periodo);
+      const taken = state.timeouts[side].filter((p) => p >= from && p <= to).length;
+      const allowed = BASKETBALL.timeoutsAllowed(periodo);
+      if (taken >= allowed) throw conflict(`El equipo ya usó sus ${allowed} tiempos muertos de este tramo`);
+    } else {
+      if (!roster.includes(jugadorId)) throw badRequest('El jugador no pertenece a ese equipo');
+      if (state.sentOff.has(jugadorId)) {
+        throw conflict(basket ? 'El jugador está eliminado del partido' : 'El jugador fue expulsado y no puede registrar más eventos');
+      }
+    }
     if (tipo === 'SUSTITUCION') {
-      if (!state.onField[side].has(jugadorId)) throw conflict('El jugador que sale no está en cancha');
+      if (!state.onField[side].has(jugadorId)) throw conflict(`El jugador que sale no está en cancha`);
       if (!roster.includes(relacionadoId)) throw badRequest('El jugador que entra no pertenece al equipo');
-      if (state.used[side].has(relacionadoId)) throw conflict('El jugador que entra ya participó en el partido');
-      if (state.subs[side] >= MAX_SUBSTITUTIONS) throw conflict(`Se alcanzó el máximo de ${MAX_SUBSTITUTIONS} sustituciones`);
-    } else if (['GOL', 'AMARILLA', 'ROJA'].includes(tipo) && !state.onField[side].has(jugadorId)) {
+      if (state.onField[side].has(relacionadoId)) throw conflict('El jugador que entra ya está en cancha');
+      if (state.sentOff.has(relacionadoId)) throw conflict('El jugador que entra está eliminado del partido');
+      // En básquetbol los cambios son ilimitados y un jugador puede volver a entrar.
+      if (!basket) {
+        if (state.used[side].has(relacionadoId)) throw conflict('El jugador que entra ya participó en el partido');
+        if (state.subs[side] >= MAX_SUBSTITUTIONS) throw conflict(`Se alcanzó el máximo de ${MAX_SUBSTITUTIONS} sustituciones`);
+      }
+    } else if ((basket ? BASKETBALL.onCourt : ['GOL', 'AMARILLA', 'ROJA']).includes(tipo) && !state.onField[side].has(jugadorId)) {
       throw conflict('El jugador no está en cancha');
     }
     if (asistenciaId !== null) {
@@ -375,10 +429,10 @@ const addEvento = async (req, res) => {
     const insert = async (tipoEvento, descripcion = null) => {
       const { rows } = await db.query(
         `INSERT INTO deportivo.eventos_partido
-           (partido_id, jugador_id, asistencia_jugador_id, relacionado_jugador_id, tipo_evento, lado, minuto, descripcion, registrado_por)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-        [id, jugadorId, tipoEvento === 'GOL' ? asistenciaId : null, tipoEvento === 'SUSTITUCION' ? relacionadoId : null,
-          tipoEvento, lado, partido.minuto, descripcion, req.user.id]
+           (partido_id, jugador_id, asistencia_jugador_id, relacionado_jugador_id, tipo_evento, lado, minuto, periodo, descripcion, registrado_por)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+        [id, jugadorId, tipoEvento === tipo ? asistenciaId : null, tipoEvento === 'SUSTITUCION' ? relacionadoId : null,
+          tipoEvento, lado, partido.minuto, basket ? periodo : null, descripcion, req.user.id]
       );
       return rows[0].id;
     };
@@ -386,13 +440,11 @@ const addEvento = async (req, res) => {
     const ids = [await insert(tipo)];
     // RF-26: la segunda amarilla genera automáticamente la roja.
     if (tipo === 'AMARILLA' && (state.yellows.get(jugadorId) ?? 0) >= 1) ids.push(await insert('ROJA', DOUBLE_YELLOW));
-    // RF-29: el marcador se actualiza con cada gol.
-    if (tipo === 'GOL') {
-      await db.query(
-        `UPDATE deportivo.resultados SET ${side === 'home' ? 'goles_local = goles_local + 1' : 'goles_visita = goles_visita + 1'}
-         WHERE partido_id = $1`,
-        [id]
-      );
+    // RF-29: el marcador se actualiza con cada gol o canasta.
+    const value = scoreValue(deporte, tipo);
+    if (value > 0) {
+      const column = side === 'home' ? 'goles_local' : 'goles_visita';
+      await db.query(`UPDATE deportivo.resultados SET ${column} = ${column} + $2 WHERE partido_id = $1`, [id, value]);
     }
     await db.query('UPDATE deportivo.partidos SET actualizado_en = now() WHERE id = $1', [id]);
     return ids;
@@ -416,9 +468,10 @@ const undoUltimoEvento = async (req, res) => {
     const toDelete = rows[0].descripcion === DOUBLE_YELLOW && rows[1] ? [rows[0], rows[1]] : [rows[0]];
     for (const e of toDelete) {
       await db.query('DELETE FROM deportivo.eventos_partido WHERE id = $1', [e.id]);
-      if (e.tipo_evento === 'GOL') {
+      const value = scoreValue(partido.deporte, e.tipo_evento);
+      if (value > 0) {
         const column = SIDES[e.lado] === 'home' ? 'goles_local' : 'goles_visita';
-        await db.query(`UPDATE deportivo.resultados SET ${column} = GREATEST(${column} - 1, 0) WHERE partido_id = $1`, [id]);
+        await db.query(`UPDATE deportivo.resultados SET ${column} = GREATEST(${column} - $2, 0) WHERE partido_id = $1`, [id, value]);
       }
     }
   });
@@ -434,6 +487,10 @@ const finalizarPartido = async (req, res) => {
     if (!partido) throw notFound('Partido no encontrado');
     assertLive(partido);
     await assertActaAccess(req, partido);
+    if (partido.deporte === BASQUETBOL) {
+      const { rows: [r] } = await db.query('SELECT goles_local, goles_visita FROM deportivo.resultados WHERE partido_id = $1', [id]);
+      if (r && r.goles_local === r.goles_visita) throw conflict('Un partido de básquetbol no termina empatado: juega una prórroga');
+    }
     await db.query(
       `UPDATE deportivo.partidos
        SET estado = 'FINALIZADO', acta_cerrada_en = now(), acta_cerrada_por = $1, actualizado_en = now()
