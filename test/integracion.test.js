@@ -45,6 +45,7 @@ before(async () => {
     UPLOADS_DIR: path.join(require('node:os').tmpdir(), `statshub-uploads-${process.pid}`),
   });
   process.env.ML_SERVICE_URL = ''; // vacía (no borrada): dotenv no la sobrescribe con la del .env
+  process.env.DATABASE_URL = ''; // tendría prioridad sobre los DB_* de la base de pruebas
 
   const { Client } = require('pg');
   const admin = new Client({ connectionString: url });

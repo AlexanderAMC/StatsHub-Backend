@@ -19,14 +19,20 @@ function sslConfig() {
   return { rejectUnauthorized: false };
 }
 
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  ssl: sslConfig(),
-});
+// DATABASE_URL (una sola URL, como la entrega Railway/Heroku) tiene prioridad sobre DB_*.
+// En Railway: DATABASE_URL=${{Postgres.DATABASE_URL}} usa la red privada (postgres.railway.internal).
+const pool = new Pool(
+  process.env.DATABASE_URL
+    ? { connectionString: process.env.DATABASE_URL, ssl: sslConfig() }
+    : {
+        host: process.env.DB_HOST,
+        port: process.env.DB_PORT,
+        database: process.env.DB_NAME,
+        user: process.env.DB_USER,
+        password: process.env.DB_PASSWORD,
+        ssl: sslConfig(),
+      }
+);
 
 // Sin este manejador, un error en un cliente inactivo (p. ej. si se reinicia PostgreSQL)
 // emite un 'error' no capturado y tumba el proceso. El pool descarta ese cliente y sigue.
